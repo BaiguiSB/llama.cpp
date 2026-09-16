@@ -46,7 +46,7 @@
 **Files:**
 - Modify: `ggml/src/ggml-cuda/fattn-mma-f16.cuh:367-477` (`flash_attn_ext_f16_load_tile`)
 
-- [ ] **Step 1.1: 修改函数模板签名**
+- [x] **Step 1.1: 修改函数模板签名**
 
 把 (fattn-mma-f16.cuh:367-370):
 
@@ -73,7 +73,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
 说明: `stride_KV` 对 F16 是 half2 单位行距, 对 q8_0 是字节行距(由内核侧按类型准备, 见 Task 2);
 `elem0` 是本次装载切片在行内的起始元素号(K 调用传 k0_start*2, V 调用传 i0_start, 无偏移调用用默认 0)。
 
-- [ ] **Step 1.2: 在非 cp_async 分支内加量化路径**
+- [x] **Step 1.2: 在非 cp_async 分支内加量化路径**
 
 现有 else 分支(fattn-mma-f16.cuh:430 起)的 `auto load = ...` lambda 之前插入类型分派, F16 路径体保持
 逐字节不变。将 else 分支改为(完整代码, 含原有 F16 逻辑):
@@ -154,7 +154,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
 注意: 原 F16 分支开头的 `const half2 zero[4] = ...;` 与 lambda 原样保留, 只是外层从 `} else {` 变成
 `} else if constexpr (type_KV == GGML_TYPE_Q8_0) { ... } else {`。
 
-- [ ] **Step 1.3: 更新文件内 6 个 load_tile 调用点传 elem0**
+- [x] **Step 1.3: 更新文件内 6 个 load_tile 调用点传 elem0**
 
 F16 与量化共用同一签名(elem0 默认 0, F16 分支不读它), 只需给两个带偏移的调用点补参:
 - fattn-mma-f16.cuh:651 (K 装载): `(K_h2 + k0_start, tile_K, k0_diff, stride_K, k_VKQ_0, k_VKQ_sup, indices)`
@@ -163,7 +163,7 @@ F16 与量化共用同一签名(elem0 默认 0, F16 分支不读它), 只需给�
   追加 `, i0_start`
 其余调用点(630, 988, 1310 附近)切片起点为 0, 用默认参数, 不改。
 
-- [ ] **Step 1.4: 自查**
+- [x] **Step 1.4: 自查**
 
 - [ ] `block_q8_0` 在本文件可见(经 fattn.cu 包含链 fattn-common.cuh -> vecdotq.cuh); 若不可见, 在
       fattn-mma-f16.cuh 头部 include 区加 `#include "vecdotq.cuh"`
@@ -180,7 +180,7 @@ F16 与量化共用同一签名(elem0 默认 0, F16 分支不读它), 只需给�
 - Modify: `ggml/src/ggml-cuda/fattn-mma-f16.cuh:~1852-1855` (stride 计算)
 - Modify: `ggml/src/ggml-cuda/fattn-mma-f16.cuh:1323,1332,1343,1352` (4 个 iter 调用点)
 
-- [ ] **Step 2.1: iter 模板加参数并透传**
+- [x] **Step 2.1: iter 模板加参数并透传**
 
 fattn-mma-f16.cuh:566-568 模板参数列表尾部追加两个参数:
 
@@ -196,7 +196,7 @@ iter 内 3 处 load_tile 显式模板实参追加类型:
 - 650 行: `flash_attn_ext_f16_load_tile<stride_tile_K, swz_K, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse, type_K>`
 - 987/1003/1310 行同理(它们在不同分支, 凡显式写模板实参的都加 type_K 或 type_V)
 
-- [ ] **Step 2.2: 内核模板加参数**
+- [x] **Step 2.2: 内核模板加参数**
 
 fattn-mma-f16.cuh:1764:
 
@@ -205,7 +205,7 @@ template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, bool V
     ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16>
 ```
 
-- [ ] **Step 2.3: 内核 prologue 的 stride 按类型计算**
+- [x] **Step 2.3: 内核 prologue 的 stride 按类型计算**
 
 把 ~1852-1855 的:
 
@@ -226,12 +226,12 @@ template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, bool V
 
 (`K_h2`/`V_h2` 指针强转保持不变, 只是地址; 若两者类型不同且 V_is_K_view 为 true 属未实例化组合, 不处理。)
 
-- [ ] **Step 2.4: 4 个 iter 调用点透传类型**
+- [x] **Step 2.4: 4 个 iter 调用点透传类型**
 
 1323/1332/1343/1352 的调用模板实参列表(在 `oob_check` 之后, T_* 之前)插入 `type_K, type_V`。
 T_* 参数仍由实参推导, 不写。
 
-- [ ] **Step 2.5: 自查**
+- [x] **Step 2.5: 自查**
 
 - [ ] 所有 load_tile 显式模板调用都补了类型参数(默认参数在显式实例化时不会自动匹配位置错误 -> 编译期暴露)
 - [ ] stride 单位注释清楚(F16: half2, q8_0: bytes)
@@ -244,7 +244,7 @@ T_* 参数仍由实参推导, 不写。
 - Modify: `ggml/src/ggml-cuda/fattn-mma-f16.cuh:2065-2066` (launch_fattn)
 - Modify: `ggml/src/ggml-cuda/fattn-mma-f16.cuh:2070-2100` (DECL 区)
 
-- [ ] **Step 3.1: case 函数模板与内核选择**
+- [x] **Step 3.1: case 函数模板与内核选择**
 
 1966 行改为:
 
@@ -257,7 +257,7 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
 函数内 4 处 `flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, use_sparse_kernel>`
 统一追加 `, type_K, type_V`。
 
-- [ ] **Step 3.2: need_f16 按类型传**
+- [x] **Step 3.2: need_f16 按类型传**
 
 2065-2066 改为:
 
@@ -270,7 +270,7 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
 (launch_fattn 的 need_f16_K/V 为 false 时直传原始量化数据与 stride, 该分支已存在,
 fattn-common.cuh:1016-1019。)
 
-- [ ] **Step 3.3: 量化实例化**
+- [x] **Step 3.3: 量化实例化**
 
 现有 DECL 宏(2070-2072)不改动(默认模板参填 F16/F16, 现有 100+ 实例化行零改动)。
 在实例化区(extern 声明区与定义区, 按 2075-2107 与 2109+ 两段的现有模式分别放置)加入:
@@ -288,14 +288,14 @@ extern DECL_FATTN_MMA_F16_CASE_Q8_0(256, 256, 64, 1)
 
 定义区(非 extern)同样四行。
 
-- [ ] **Step 3.4: 自查 + 编译门(V100 机器)**
+- [x] **Step 3.4: 自查 + 编译门(V100 机器)**
 
 - [ ] 确认 fattn.cu 里 switch 函数调用的 case 符号不变(默认参数, 4 参调用仍合法)
 - [ ] 用户执行: `cmake --build build --target ggml -j` -> 编译通过(量化实例化会强制实例化内核模板,
       模板错误在此暴露)
 - [ ] 此时行为无任何变化(没有分派入口), 属安全中间态
 
-- [ ] **Step 3.5: Commit 1**
+- [x] **Step 3.5: Commit 1**
 
 ```bash
 git add ggml/src/ggml-cuda/fattn-mma-f16.cuh
@@ -309,7 +309,7 @@ git commit -m "cuda : FA MMA 内核装载支持 q8_0 直读 (D=256)"
 - Modify: `ggml/src/ggml-cuda/fattn.cu:690-724` (`ggml_cuda_flash_attn_ext_get_alloc_size`)
 - 新增两个静态函数(放在 `ggml_cuda_flash_attn_ext_mma_f16` 之前)
 
-- [ ] **Step 4.1: 加共享谓词**
+- [x] **Step 4.1: 加共享谓词**
 
 ```cpp
 // must stay in sync with ggml_cuda_flash_attn_ext_mma_f16_q8 below and with
@@ -372,7 +372,7 @@ V_is_K_view 恒 false(D=256, fattn-mma-f16.cuh:1986)。
 本函数在 alloc_size(图分配期)与运行时分派两处调用, 输入只依赖张量元数据(同一图内不变),
 两处结果必然一致 -> 不存在"分配无 staging 但运行要 staging"的错配。
 
-- [ ] **Step 4.2: 加量化分派函数**
+- [x] **Step 4.2: 加量化分派函数**
 
 ```cpp
 template <int DKQ, int DV>
@@ -440,7 +440,7 @@ static void ggml_cuda_flash_attn_ext_mma_f16_q8(ggml_backend_cuda_context & ctx,
 说明: 这里的 gqa_opt/ncols 计算与 Step 4.1 谓词逐行相同(注释互指, 两处必须同步修改);
 谓词通过后组合理论上必命中前四支, 末行 fallback 仅为纵深防御。
 
-- [ ] **Step 4.3: case 256 接入**
+- [x] **Step 4.3: case 256 接入**
 
 fattn.cu 的 `ggml_cuda_flash_attn_ext_mma_f16` 内(fattn.cu:289-292):
 
@@ -455,7 +455,7 @@ fattn.cu 的 `ggml_cuda_flash_attn_ext_mma_f16` 内(fattn.cu:289-292):
             break;
 ```
 
-- [ ] **Step 4.4: alloc_size 接入**
+- [x] **Step 4.4: alloc_size 接入**
 
 fattn.cu:705-710 改为:
 
@@ -476,14 +476,14 @@ fattn.cu:705-710 改为:
 
 (量化时 need_f16_K/V 保持 false, staging 预留消失。)
 
-- [ ] **Step 4.5: 自查 + 编译门(V100 机器)**
+- [x] **Step 4.5: 自查 + 编译门(V100 机器)**
 
 - [ ] 谓词与分派函数逻辑逐行对照一致(注释互指)
 - [ ] `GGML_TYPE_Q8_0` 在 fattn.cu 可用(已包含 ggml 头, 现有代码在用)
 - [ ] 用户执行: `cmake --build build --target ggml -j` -> 通过
 - [ ] 用户执行 Task 5 的完整验证命令集
 
-- [ ] **Step 4.6: Commit 2**
+- [x] **Step 4.6: Commit 2**
 
 ```bash
 git add ggml/src/ggml-cuda/fattn.cu
