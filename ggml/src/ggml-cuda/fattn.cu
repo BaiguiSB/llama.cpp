@@ -5,6 +5,8 @@
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
 
+#include <cstdlib>
+
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 __launch_bounds__(256, 1)
 static __global__ void flash_attn_mask_to_sparse_indices(
@@ -261,6 +263,121 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
     }
 }
 
+// must stay in sync with ggml_cuda_flash_attn_ext_mma_f16_q8 below and with
+// the Volta branch of ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2/_ncols1
+static bool ggml_cuda_flash_attn_ext_mma_f16_q8_supported(const ggml_tensor * dst) {
+    static const bool fallback = getenv("GGML_CUDA_FA_MMA_QUANT_FALLBACK") != nullptr;
+    if (fallback) {
+        return false;
+    }
+
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * V    = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+
+    if (Q->ne[0] != 256 || K->ne[0] != 256 || V->ne[0] != 256) {
+        return false;
+    }
+    if (K->type != GGML_TYPE_Q8_0 || V->type != GGML_TYPE_Q8_0) {
+        return false;
+    }
+
+    float max_bias = 0.0f;
+    memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
+
+    bool gqa_opt = mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
+    for (const ggml_tensor * t : {Q, mask}) {
+        if (t == nullptr) {
+            continue;
+        }
+        for (size_t i = 1; i < GGML_MAX_DIMS; ++i) {
+            if (t->nb[i] % 16 != 0) {
+                gqa_opt = false;
+                break;
+            }
+        }
+    }
+
+    GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
+    const int gqa_ratio = Q->ne[2] / K->ne[2];
+
+    int ncols2 = 1;
+    if (gqa_opt && gqa_ratio % 8 == 0) {
+        ncols2 = 8;
+    } else if (gqa_opt && gqa_ratio % 4 == 0) {
+        ncols2 = 4;
+    } else if (gqa_opt && gqa_ratio % 2 == 0) {
+        ncols2 = 2;
+    }
+
+    const int ncols1 = Q->ne[1] <= 16/ncols2 ? 16/ncols2 : (Q->ne[1] <= 32/ncols2 ? 32/ncols2 : 64/ncols2);
+
+    return (ncols1 == 16 && ncols2 == 2) || (ncols1 == 32 && ncols2 == 2) ||
+           (ncols1 == 32 && ncols2 == 1) || (ncols1 == 64 && ncols2 == 1);
+}
+
+template <int DKQ, int DV>
+static void ggml_cuda_flash_attn_ext_mma_f16_q8(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    GGML_ASSERT(DKQ == 256 && DV == 256);
+
+    const ggml_tensor * KQV  = dst;
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * mask = dst->src[3];
+
+    float max_bias = 0.0f;
+    memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
+
+    bool gqa_opt = mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
+    for (const ggml_tensor * t : {Q, mask}) {
+        if (t == nullptr) {
+            continue;
+        }
+        for (size_t i = 1; i < GGML_MAX_DIMS; ++i) {
+            if (t->nb[i] % 16 != 0) {
+                gqa_opt = false;
+                break;
+            }
+        }
+    }
+
+    GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
+    const int gqa_ratio = Q->ne[2] / K->ne[2];
+
+    // mirror of the Volta branch in ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2
+    int ncols2 = 1;
+    if (gqa_opt && gqa_ratio % 8 == 0) {
+        ncols2 = 8;
+    } else if (gqa_opt && gqa_ratio % 4 == 0) {
+        ncols2 = 4;
+    } else if (gqa_opt && gqa_ratio % 2 == 0) {
+        ncols2 = 2;
+    }
+
+    const int ncols1 = Q->ne[1] <= 16/ncols2 ? 16/ncols2 : (Q->ne[1] <= 32/ncols2 ? 32/ncols2 : 64/ncols2);
+
+    if (ncols2 == 2 && ncols1 == 16) {
+        ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 16, 2, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0>(ctx, dst);
+        return;
+    }
+    if (ncols2 == 2 && ncols1 == 32) {
+        ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 32, 2, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0>(ctx, dst);
+        return;
+    }
+    if (ncols2 == 1 && ncols1 == 32) {
+        ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 32, 1, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0>(ctx, dst);
+        return;
+    }
+    if (ncols2 == 1 && ncols1 == 64) {
+        ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 64, 1, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0>(ctx, dst);
+        return;
+    }
+
+    // combination not instantiated, use the f16 path
+    ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2<DKQ, DV>(ctx, dst);
+}
+
 static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const ggml_tensor * KQV  = dst;
@@ -308,6 +425,10 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
         } break;
         case 256:
             GGML_ASSERT(V->ne[0] == 256);
+            if (ggml_cuda_flash_attn_ext_mma_f16_q8_supported(dst)) {
+                ggml_cuda_flash_attn_ext_mma_f16_q8<256, 256>(ctx, dst);
+                break;
+            }
             ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2<256, 256>(ctx, dst);
             break;
         case 320:
@@ -704,7 +825,14 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
     switch (kernel) {
         case BEST_FATTN_KERNEL_TILE:
+            need_f16_K = true;
+            need_f16_V = true;
+            break;
         case BEST_FATTN_KERNEL_MMA_F16:
+            // q8_0 direct loading needs no f16 staging, must match the dispatch above
+            if (ggml_cuda_flash_attn_ext_mma_f16_q8_supported(dst)) {
+                break;
+            }
             need_f16_K = true;
             need_f16_V = true;
             break;
