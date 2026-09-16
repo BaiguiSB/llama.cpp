@@ -59,7 +59,7 @@ nvidia-smi dmon -s um
 - 佐证细节: n_kv 被 pad 到 256 倍数 (llama-kv-cache.cpp `get_n_kv`), VEC 对齐条件恒满足
 - 量化 KV 会启用 Hadamard rotation (llama-kv-cache.cpp, `ggml_is_quantized` 门控, QuaRot 式), 这是量化 KV 质量的关键, 改造不得破坏
 
-## 方案 B: TILE 内核直读量化 KV (当前主线)
+## 方案 B: TILE 内核直读量化 KV (通用改造, 目标模型下的定位见"目标模型"节)
 
 核心思想: decode 是显存带宽瓶颈, 消灭 staging 往返, 让 TILE 在装载时反量化直接进 shared memory, 下游计算路径不动。
 
@@ -83,6 +83,24 @@ nvidia-smi dmon -s um
 - prefill 仍走 MMA_F16 + staging: 接受(参考库同款妥协, prefill 算力受限不敏感), 后续可做"MMA 内 shared 级 staging"
 - VEC 不动; K/V cache 是独立张量, K 与 V 的反量化路径都要实现
 - 已否决/搁置: 方案 A(放宽 VEC 路由给 GQA decode, 赌 L2 去重, 只作对照实验, 最坏比现状差 60%); fp8_e4m3 KV(ggml 无 F8 类型, 端到端新类型工程量是方案 B 的 2-4 倍, 只省 6% 显存; 若将来做, Hadamard rotation 需手动接线, fa-v100 的软件转换可抄)
+
+## 目标模型: Qwen3.5-27B (qwen35, 带视觉与 MTP)
+
+注意力画像(决定所有 FA 优化):
+- 64 层 = 48 层线性注意力(GDN, 无 KV cache) + 16 层 full attention(标准 KV cache + FA)
+- full attn: 24 Q 头 / 4 KV 头 / head_dim 256 -> gqa_ratio=6, gqa_ratio_eff=2; max_position 262K
+- MTP 1 层(qwen35.cpp 有 graph_mtp); KV 每 token: F16 64KB / q8_0 33.5KB / q4_0 17.8KB(只有 16 层, 比常规模型小 4 倍)
+
+该模型在 V100 上的 FA 路由(注意与通用结论的差异):
+- 单序列 decode: 有效 batch 1x2=2 -> VEC, 量化直读, 无 staging(通用警告"gqa%4 落 TILE"对 6:1 不适用)
+- MTP verify(k>=2 个 draft)与多序列 decode: 有效 batch >=4 -> TILE -> staging 往返
+- prefill: MMA_F16 -> staging 往返; 二次方增长, 64K 上下文时 staging 流量(~10.7GB/ubatch)与 tensor core 计算同级, full-attn prefill 被拖慢 1.7-2x
+
+针对性优化优先级:
+- P0: MMA_F16 量化直读(内核内 dequant -> shared), 改造点 fattn-mma-f16.cuh 的 flash_attn_ext_f16_load_tile(K/V 本来就过 shared 带 swizzle; V100 无 cp.async, Volta 路径本来就是同步 LDG+STS, 无流水线损失); 只做 D=256 形状, 模板面窄。收益: 长文 prefill 1.5-2x, verify 同吃
+- P0.5: lm_head 量化检查(vocab 248K, F16 2.5GB, 每 step 全读 ~2.8ms=14% step; 转 GGUF 用 --output-tensor-type q6_K/q8_0, ~10% decode 提速)
+- P1: 方案 B(TILE 量化直读)定位调整: 服务 MTP verify 与多序列 decode, 普通 decode 用不上
+- P2: 量化 decode 路由实验(VEC 只有 24 block, 占用率 30%; P1 后可试 TILE 分区+GQA 打包, 预期 3-5%)
 
 ## flash-attention-v100/ 参考库(只读)
 
