@@ -721,7 +721,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             const int k0_diff = k0_stop - k0_start;
             constexpr bool use_cp_async = nstages == 1;
             flash_attn_ext_f16_load_tile<stride_tile_K, swz_K, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse, type_K>
-                (K_h2 + k0_start, tile_K, k0_diff, stride_K, k_VKQ_0, k_VKQ_sup, indices, k0_start*2);
+                // f16 locates the slice by advancing the base pointer, quantized types must keep the
+                // row base and locate it via elem0 (34 B q8_0 blocks cannot be addressed in half2 units).
+                (type_K == GGML_TYPE_F16 ? K_h2 + k0_start : K_h2, tile_K, k0_diff, stride_K,
+                 k_VKQ_0, k_VKQ_sup, indices, k0_start*2);
             if (use_cp_async) {
                 cp_async_wait_all();
             }
@@ -1074,7 +1077,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             if (!V_is_K_view || i0_stop > 2*nbatch_K2) {
                 constexpr bool use_cp_async = nstages == 1;
                 flash_attn_ext_f16_load_tile<stride_tile_V, swz_V, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse, type_V>
-                    (V_h2 + i0_start/2, tile_V, i0_diff/2, stride_V, k_VKQ_0, k_VKQ_sup, indices, i0_start);
+                    (type_V == GGML_TYPE_F16 ? V_h2 + i0_start/2 : V_h2, tile_V, i0_diff/2, stride_V,
+                     k_VKQ_0, k_VKQ_sup, indices, i0_start);
                 if (use_cp_async) {
                     cp_async_wait_all();
                 }
