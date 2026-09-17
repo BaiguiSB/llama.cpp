@@ -91,13 +91,22 @@ nvidia-smi dmon -s um
 - full attn: 24 Q 头 / 4 KV 头 / head_dim 256 -> gqa_ratio=6, gqa_ratio_eff=2; max_position 262K
 - MTP 1 层(qwen35.cpp 有 graph_mtp); KV 每 token: F16 64KB / q8_0 33.5KB / q4_0 17.8KB(只有 16 层, 比常规模型小 4 倍)
 
+本地实际模型(2026-09 确认): **Qwen3.8-27B**, 与上面同一 qwen3_5 架构(HF config 的 model_type 就是 "qwen3_5"/Qwen3_5ForConditionalGeneration), 注意力画像逐项吻合:
+- 文件: /home/baigui/nvme/models/Qwen3.8-27B/Qwen3.8-27B-UD-Q4_K_M.gguf(主模型) 与 mtp-Qwen3.8-27B-Q4_0.gguf(MTP draft); HF config 副本暂存仓库根 qwen3.8-27b.json(未提交)
+- 补充 shape 事实: full_attention_interval=4; vocab 248320; hidden 5120; 无 ALiBi(max_bias=0, 分派 gqa_opt 成立); partial_rotary_factor 0.25 + mrope_interleaved section [11,11,10]; 线性注意力 16 k 头/48 v 头 x 128 维
+- 对照基线树: /home/baigui/nvme/llama.cpp(上游 vanilla, 供 A/B 对拍构建)
+
 该模型在 V100 上的 FA 路由(注意与通用结论的差异):
 - 单序列 decode: 有效 batch 1x2=2 -> VEC, 量化直读, 无 staging(通用警告"gqa%4 落 TILE"对 6:1 不适用)
 - MTP verify(k>=2 个 draft)与多序列 decode: 有效 batch >=4 -> TILE -> staging 往返
 - prefill: MMA_F16 -> staging 往返; 二次方增长, 64K 上下文时 staging 流量(~10.7GB/ubatch)与 tensor core 计算同级, full-attn prefill 被拖慢 1.7-2x
 
 针对性优化优先级:
-- P0: MMA_F16 量化直读(内核内 dequant -> shared), 改造点 fattn-mma-f16.cuh 的 flash_attn_ext_f16_load_tile(K/V 本来就过 shared 带 swizzle; V100 无 cp.async, Volta 路径本来就是同步 LDG+STS, 无流水线损失); 只做 D=256 形状, 模板面窄。收益: 长文 prefill 1.5-2x, verify 同吃
+- P0: [已落地 2026-09-17] MMA_F16 量化直读(内核内 dequant -> shared), 改造点 fattn-mma-f16.cuh 的 flash_attn_ext_f16_load_tile(K/V 本来就过 shared 带 swizzle; V100 无 cp.async, Volta 路径本来就是同步 LDG+STS, 无流水线损失); 只做 D=256 形状, 模板面窄。收益: 长文 prefill 1.5-2x, verify 同吃
+  - 提交链: 7556cb465(内核装载) e8446f649(分派/显存接入) fcfb3833a(补 process_tile 漏掉的 type_K/type_V 模板参数 —— 该遗漏使 q8_0 实例 TU 从 7556cb465 起一直编译失败, 即该路径此前从未真正构建过) e76a66dca(修 K/V 切片装载指针前移与 elem0 双重计账; 当前 D=256 实例 elem0 恒 0 无症状, 分片形状(320/256, 512/512, 576/512)或 Volta 调参降 nbatch_K2/nbatch_V2 会静默读错)
+  - 实例与分派: (256,256) x {(16,2),(32,2),(32,1),(64,1)}, fattn.cu `ggml_cuda_flash_attn_ext_mma_f16_q8_supported()`: D=256 + q8_0-q8_0 + 上述 4 组合, 否则逐调用静默回退 F16+staging; env GGML_CUDA_FA_MMA_QUANT_FALLBACK=1 强制回退(做 A/B 正控制用)
+  - 本模型实际进入情况: prefill ubatch(512 行) -> (32,2) 实例命中; Q 行数 <=8 的尾巴 ubatch -> (8,2) 未实例化逐调用回退(supported() 与 alloc_size 互为镜像, 无显存错配); decode 单 token -> VEC; MTP verify -> TILE(仍 staging, 归 P1)
+  - 验证方法论(重要): q8_0 与 baseline 的 PPL 逐位一致是设计预期(load_tile 反量化链与 convert.cu dequantize_block_q8_0_f16 是同一条 __hmul2), 因此 PPL 对拍既不能证明路径进入也不能证伪; 正控制 = 同一二进制设/不设 GGML_CUDA_FA_MMA_QUANT_FALLBACK 对比 compute buffer 大小(应差一个 staging)与 eval 时间。2026-09-17 实测 PPL 均值方差与 baseline 完全一致, 正控制待跑
 - P0.5: lm_head 量化检查(vocab 248K, F16 2.5GB, 每 step 全读 ~2.8ms=14% step; 转 GGUF 用 --output-tensor-type q6_K/q8_0, ~10% decode 提速)
 - P1: 方案 B(TILE 量化直读)定位调整: 服务 MTP verify 与多序列 decode, 普通 decode 用不上
 - P2: 量化 decode 路由实验(VEC 只有 24 block, 占用率 30%; P1 后可试 TILE 分区+GQA 打包, 预期 3-5%)
