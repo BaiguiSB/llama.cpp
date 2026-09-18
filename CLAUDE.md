@@ -62,6 +62,8 @@ nvidia-smi dmon -s um
 
 ## 方案 B: TILE 内核直读量化 KV (通用改造, 目标模型下的定位见"目标模型"节)
 
+[q8_0 已落地 2026-09-18 于分支 v100/tile-q8-direct, 实施细节与验证状态见下方"针对性优化优先级"P1 条目; 本节保留原始设计。]
+
 核心思想: decode 是显存带宽瓶颈, 消灭 staging 往返, 让 TILE 在装载时反量化直接进 shared memory, 下游计算路径不动。
 
 改造点(按依赖顺序):
@@ -110,7 +112,12 @@ nvidia-smi dmon -s um
   - 验证方法论(重要): q8_0 与 baseline 的 PPL 逐位一致是设计预期(load_tile 反量化链与 convert.cu dequantize_block_q8_0_f16 是同一条 __hmul2), 因此 PPL 对拍既不能证明路径进入也不能证伪; 正控制 = 同一二进制设/不设 GGML_CUDA_FA_MMA_QUANT_FALLBACK 对比 compute buffer 大小(应差一个 staging)与 eval 时间。2026-09-17 实测 PPL 均值方差与 baseline 完全一致, 正控制待跑
   - 实测落地后perfill速度下降0.7%，属于负优化，改动都在分支`v100/mma-q8-direct`
 - P0.5: lm_head 量化检查(vocab 248K, F16 2.5GB, 每 step 全读 ~2.8ms=14% step; 转 GGUF 用 --output-tensor-type q6_K/q8_0, ~10% decode 提速)
-- P1: 方案 B(TILE 量化直读)定位调整: 服务 MTP verify 与多序列 decode, 普通 decode 用不上
+- P1: [已落地 2026-09-18, 分支 v100/tile-q8-direct] 方案 B(TILE 量化直读)定位调整: 服务 MTP verify 与多序列 decode, 普通 decode 用不上
+  - 改造点: fattn-tile.cuh `flash_attn_tile_load_tile` 加 type_KV/elem0(K 与 V 共用此函数), q8_0 分支复用 fattn-common.cuh `dequantize_V_q8_0<half,2*cpy_ne>` 寄存器反量化写 shared; iter_KQ/iter/kernel 透传 type_K/type_V, q8_0 时 stride 保持字节单位; q8_0 行(34B 块)无法 half2 指针前移定位切片, K 尾段由 elem0 定位(F16 走指针前移, 互斥不重复计账)
+  - 提交链: 4cddb5514(内核装载) 0d9531b73(分派/显存接入 + 实例文件)
+  - 实例与分派: (256,256) x ncols2∈{1,2} x ncols1∈{1,2,4,8,16} 共 9 组(ncols2=1 时 ncols1 恒 >=2), 实例文件 fattn-tile-instance-dkq256-dv256-q8_0.cu(CMake GLOB 自动收编, 新文件需重新 configure); ncols2=4/8(gqa%4 模型)与 ncols1=32 暂回退 staging, 扩容=加 DECL + 放宽 `ggml_cuda_fattn_tile_q8_supported` 里两处检查
+  - 与 mma 分支的关键差异: supported()(fattn-tile.cu)是分派与 get_alloc_size 共用的唯一判定源, staging 恰好在被使用时才预留, 结构性规避 supported/alloc 镜像失配 bug 类; env GGML_CUDA_FA_TILE_QUANT_FALLBACK=1 强制回退(A/B 正控制)
+  - 验证状态: 构建通过(9 实例 + 符号已确认); 运行级验证未跑(本回合禁用 GPU)。正控制 = 设/不设 env 对比 compute buffer 尺寸(应差一个 staging)与 tg t/s, 命令: `llama-bench -m <模型> -ngl 99 -fa 1 -ctk q8_0 -ctv q8_0 -p 512 -n 128 -np 4`(-np 2/8 变体; 多序列 -> TILE); 数值上 load 反量化链与 staging 同一条 __hmul2, env 开/关生成文本应逐 token 一致
 - P2: 量化 decode 路由实验(VEC 只有 24 block, 占用率 30%; P1 后可试 TILE 分区+GQA 打包, 预期 3-5%)
 
 ## flash-attention-v100/ 参考库(只读)
