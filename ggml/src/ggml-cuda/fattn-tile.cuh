@@ -1385,6 +1385,55 @@ void ggml_cuda_flash_attn_ext_tile_case(ggml_backend_cuda_context & ctx, ggml_te
 
 void ggml_cuda_flash_attn_ext_tile(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
+// Direct q8_0 K/V loading for the tile kernel, only (DKQ, DV) == (256, 256) is instantiated.
+// The output (ncols1, ncols2) mirrors launch_fattn_tile_switch_ncols2/_ncols1 for F16;
+//     this function is the single source of truth shared by the dispatch in
+//     ggml_cuda_flash_attn_ext_tile and by ggml_cuda_flash_attn_ext_get_alloc_size,
+//     so the f16 staging buffer is reserved if and only if it is actually used.
+// Set GGML_CUDA_FA_TILE_QUANT_FALLBACK to force the f16 staging path (for A/B testing).
+bool ggml_cuda_fattn_tile_q8_supported(const ggml_tensor * dst, int * ncols1_out = nullptr, int * ncols2_out = nullptr);
+
+template <int DKQ, int DV, int ncols1, int ncols2>
+void ggml_cuda_flash_attn_ext_tile_case_q8(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const int id        = ggml_cuda_get_device();
+    const int cc        = ggml_cuda_info().devices[id].cc;
+    const int warp_size = 32;
+
+    constexpr int ncols = ncols1*ncols2;
+
+    constexpr size_t nbytes_shared = 0;
+
+    const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, ncols, cc) / warp_size;
+    const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, ncols, cc);
+    fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, ncols1, ncols2, false, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0>;
+    launch_fattn<DV, ncols1, ncols2>
+        (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa, false, false, false, false, warp_size);
+}
+
+template <int DKQ, int DV>
+void ggml_cuda_flash_attn_ext_tile_q8(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    int ncols1, ncols2;
+    GGML_ASSERT(ggml_cuda_fattn_tile_q8_supported(dst, &ncols1, &ncols2));
+
+    if (ncols2 == 2) {
+        switch (ncols1) {
+            case  1: ggml_cuda_flash_attn_ext_tile_case_q8<DKQ, DV,  1, 2>(ctx, dst); return;
+            case  2: ggml_cuda_flash_attn_ext_tile_case_q8<DKQ, DV,  2, 2>(ctx, dst); return;
+            case  4: ggml_cuda_flash_attn_ext_tile_case_q8<DKQ, DV,  4, 2>(ctx, dst); return;
+            case  8: ggml_cuda_flash_attn_ext_tile_case_q8<DKQ, DV,  8, 2>(ctx, dst); return;
+            case 16: ggml_cuda_flash_attn_ext_tile_case_q8<DKQ, DV, 16, 2>(ctx, dst); return;
+        }
+    } else {
+        switch (ncols1) {
+            case  2: ggml_cuda_flash_attn_ext_tile_case_q8<DKQ, DV,  2, 1>(ctx, dst); return;
+            case  4: ggml_cuda_flash_attn_ext_tile_case_q8<DKQ, DV,  4, 1>(ctx, dst); return;
+            case  8: ggml_cuda_flash_attn_ext_tile_case_q8<DKQ, DV,  8, 1>(ctx, dst); return;
+            case 16: ggml_cuda_flash_attn_ext_tile_case_q8<DKQ, DV, 16, 1>(ctx, dst); return;
+        }
+    }
+    GGML_ABORT("fatal error");
+}
+
 #define DECL_FATTN_TILE_CASE(DKQ, DV)                             \
     template void ggml_cuda_flash_attn_ext_tile_case              \
     <DKQ, DV>(ggml_backend_cuda_context & ctx, ggml_tensor * dst) \
@@ -1401,3 +1450,19 @@ extern DECL_FATTN_TILE_CASE(256, 256);
 extern DECL_FATTN_TILE_CASE(320, 256);
 extern DECL_FATTN_TILE_CASE(512, 512);
 extern DECL_FATTN_TILE_CASE(576, 512);
+
+#define DECL_FATTN_TILE_CASE_Q8(DKQ, DV, ncols1, ncols2)               \
+    template void ggml_cuda_flash_attn_ext_tile_case_q8                \
+    <DKQ, DV, ncols1, ncols2>(ggml_backend_cuda_context & ctx, ggml_tensor * dst) \
+
+// combinations reachable via the ncols1/ncols2 ladders for ncols2 <= 2, see
+// ggml_cuda_fattn_tile_q8_supported (ncols2 == 1 never produces ncols1 == 1)
+extern DECL_FATTN_TILE_CASE_Q8(256, 256,  1, 2);
+extern DECL_FATTN_TILE_CASE_Q8(256, 256,  2, 1);
+extern DECL_FATTN_TILE_CASE_Q8(256, 256,  2, 2);
+extern DECL_FATTN_TILE_CASE_Q8(256, 256,  4, 1);
+extern DECL_FATTN_TILE_CASE_Q8(256, 256,  4, 2);
+extern DECL_FATTN_TILE_CASE_Q8(256, 256,  8, 1);
+extern DECL_FATTN_TILE_CASE_Q8(256, 256,  8, 2);
+extern DECL_FATTN_TILE_CASE_Q8(256, 256, 16, 1);
+extern DECL_FATTN_TILE_CASE_Q8(256, 256, 16, 2);
