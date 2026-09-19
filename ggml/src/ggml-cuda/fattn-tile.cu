@@ -1,17 +1,10 @@
 #include "common.cuh"
 #include "fattn-tile.cuh"
 
-#include <cstdlib>
-
 // Single source of truth for the tile q8_0 direct-loading path, consulted by both
 // ggml_cuda_flash_attn_ext_tile (dispatch) and ggml_cuda_flash_attn_ext_get_alloc_size
 // (f16 staging reservation). Must mirror launch_fattn_tile_switch_ncols2/_ncols1.
 bool ggml_cuda_fattn_tile_q8_supported(const ggml_tensor * dst, int * ncols1_out, int * ncols2_out) {
-    static const bool fallback = getenv("GGML_CUDA_FA_TILE_QUANT_FALLBACK") != nullptr;
-    if (fallback) {
-        return false;
-    }
-
     const ggml_tensor * Q    = dst->src[0];
     const ggml_tensor * K    = dst->src[1];
     const ggml_tensor * V    = dst->src[2];
