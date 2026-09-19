@@ -1,6 +1,8 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
 
+#include <cstdio>
+
 // nbatch_fa == number of KQ rows to process per iteration
 // nbatch_K == number of K columns to load in parallel for KQ calculation
 
@@ -1390,11 +1392,19 @@ void ggml_cuda_flash_attn_ext_tile(ggml_backend_cuda_context & ctx, ggml_tensor 
 //     this function is the single source of truth shared by the dispatch in
 //     ggml_cuda_flash_attn_ext_tile and by ggml_cuda_flash_attn_ext_get_alloc_size,
 //     so the f16 staging buffer is reserved if and only if it is actually used.
-// Set GGML_CUDA_FA_TILE_QUANT_FALLBACK to force the f16 staging path (for A/B testing).
 bool ggml_cuda_fattn_tile_q8_supported(const ggml_tensor * dst, int * ncols1_out = nullptr, int * ncols2_out = nullptr);
 
 template <int DKQ, int DV, int ncols1, int ncols2>
 void ggml_cuda_flash_attn_ext_tile_case_q8(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    // Each instantiated (ncols1, ncols2) reports itself once on first use, so a bench run
+    // can confirm from the console that the q8_0 direct-loading path was actually taken.
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        fprintf(stderr, "%s: FA TILE q8_0 direct path taken, DKQ = %d, DV = %d, ncols1 = %d, ncols2 = %d\n",
+                __func__, DKQ, DV, ncols1, ncols2);
+    }
+
     const int id        = ggml_cuda_get_device();
     const int cc        = ggml_cuda_info().devices[id].cc;
     const int warp_size = 32;
