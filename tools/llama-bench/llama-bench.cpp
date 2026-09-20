@@ -368,6 +368,7 @@ struct cmd_params {
     std::vector<uint32_t>            fit_params_min_ctx;
     ggml_numa_strategy               numa;
     int                              reps;
+    std::vector<int>                 n_tg_step;
     ggml_sched_priority              prio;
     int                              delay;
     bool                             verbose;
@@ -413,6 +414,7 @@ static const cmd_params cmd_params_defaults = {
     /* fit_params_min_ctx   */ { 0 },
     /* numa                 */ GGML_NUMA_STRATEGY_DISABLED,
     /* reps                 */ 5,
+    /* n_tg_step            */ { 1 },
     /* prio                 */ GGML_SCHED_PRIO_NORMAL,
     /* delay                */ 0,
     /* verbose              */ false,
@@ -429,6 +431,10 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -h, --help\n");
     printf("  --numa <distribute|isolate|numactl>         numa mode (default: disabled)\n");
     printf("  -r, --repetitions <n>                       number of times to repeat each test (default: %d)\n", cmd_params_defaults.reps);
+    printf("  -ntgs, --n-tg-step <n>                      tokens per generation step, single sequence at consecutive\n");
+    printf("                                               positions (MTP verify shape, V100: n>=2 routes FA to the TILE\n");
+    printf("                                               kernel; only compare t/s at equal -ntgs) (default: %s)\n",
+        join(cmd_params_defaults.n_tg_step, ",").c_str());
     printf("  --prio <-1|0|1|2|3>                         process/thread priority (default: %d)\n", cmd_params_defaults.prio);
     printf("  --delay <0...N> (seconds)                   delay between each test (default: %d)\n", cmd_params_defaults.delay);
     printf("  -o, --output <csv|json|jsonl|md|sql>        output format printed to stdout (default: %s)\n", output_format_str(cmd_params_defaults.output_format));
@@ -1012,6 +1018,23 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     break;
                 }
                 params.reps = std::stoi(argv[i]);
+            } else if (arg == "-ntgs" || arg == "--n-tg-step") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = parse_int_range(argv[i]);
+                for (const auto & ntgs : p) {
+                    if (ntgs < 1) {
+                        fprintf(stderr, "error: -ntgs values must be >= 1\n");
+                        invalid_param = true;
+                        break;
+                    }
+                }
+                if (invalid_param) {
+                    break;
+                }
+                params.n_tg_step.insert(params.n_tg_step.end(), p.begin(), p.end());
             } else if (arg == "--prio") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1115,6 +1138,9 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.n_depth.empty()) {
         params.n_depth = cmd_params_defaults.n_depth;
     }
+    if (params.n_tg_step.empty()) {
+        params.n_tg_step = cmd_params_defaults.n_tg_step;
+    }
     if (params.n_batch.empty()) {
         params.n_batch = cmd_params_defaults.n_batch;
     }
@@ -1195,6 +1221,7 @@ struct cmd_params_instance {
     std::string        model;
     int                n_prompt;
     int                n_gen;
+    int                n_tg_step;
     int                n_depth;
     int                n_batch;
     int                n_ubatch;
@@ -1340,6 +1367,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .model                 = */ m,
                 /* .n_prompt              = */ n_prompt,
                 /* .n_gen                 = */ 0,
+                /* .n_tg_step             = */ 1, // not used, this instance has no generation
                 /* .n_depth               = */ nd,
                 /* .n_batch               = */ nb,
                 /* .n_ubatch              = */ nub,
@@ -1373,10 +1401,12 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
             if (n_gen == 0) {
                 continue;
             }
+        for (const auto & ntgs : params.n_tg_step) {
             cmd_params_instance instance = {
                 /* .model                 = */ m,
                 /* .n_prompt              = */ 0,
                 /* .n_gen                 = */ n_gen,
+                /* .n_tg_step             = */ ntgs,
                 /* .n_depth               = */ nd,
                 /* .n_batch               = */ nb,
                 /* .n_ubatch              = */ nub,
@@ -1405,15 +1435,18 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
             };
             instances.push_back(instance);
         }
+        }
 
         for (const auto & n_pg : params.n_pg) {
             if (n_pg.first == 0 && n_pg.second == 0) {
                 continue;
             }
+        for (const auto & ntgs : params.n_tg_step) {
             cmd_params_instance instance = {
                 /* .model                 = */ m,
                 /* .n_prompt              = */ n_pg.first,
                 /* .n_gen                 = */ n_pg.second,
+                /* .n_tg_step             = */ ntgs,
                 /* .n_depth               = */ nd,
                 /* .n_batch               = */ nb,
                 /* .n_ubatch              = */ nub,
@@ -1441,6 +1474,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .fit_min_ctx           = */ fpc,
             };
             instances.push_back(instance);
+        }
         }
     }
     // clang-format on
@@ -1483,6 +1517,7 @@ struct test {
     uint32_t                 fit_min_ctx;
     int                      n_prompt;
     int                      n_gen;
+    int                      n_tg_step;
     int                      n_depth;
     std::string              test_time;
     std::vector<uint64_t>    samples_ns;
@@ -1523,6 +1558,7 @@ struct test {
         fit_min_ctx    = inst.fit_min_ctx;
         n_prompt       = inst.n_prompt;
         n_gen          = inst.n_gen;
+        n_tg_step      = inst.n_tg_step;
         n_depth        = inst.n_depth;
         // RFC 3339 date-time format
         time_t t       = time(NULL);
@@ -1580,7 +1616,7 @@ struct test {
             "tensor_buft_overrides",            "load_mode",     "lazy_mode",
             "embeddings",
             "no_op_offload",  "no_host",        "fit_target",    "fit_min_ctx",
-            "n_prompt",       "n_gen",          "n_depth",
+            "n_prompt",       "n_gen",          "n_tg_step",     "n_depth",
             "test_time",      "avg_ns",         "stddev_ns",     "avg_ts",         "stddev_ts"
         };
         return fields;
@@ -1591,7 +1627,8 @@ struct test {
     static field_type get_field_type(const std::string & field) {
         if (field == "build_number" || field == "n_batch" || field == "n_ubatch" || field == "n_threads" ||
             field == "poll" || field == "model_size" || field == "model_n_params" || field == "n_gpu_layers" ||
-            field == "main_gpu" || field == "n_prompt" || field == "n_gen" || field == "n_depth" || field == "avg_ns" ||
+            field == "main_gpu" || field == "n_prompt" || field == "n_gen" || field == "n_tg_step" ||
+            field == "n_depth" || field == "avg_ns" ||
             field == "stddev_ns" || field == "no_op_offload" || field == "n_cpu_moe" ||
             field == "fit_target" || field == "fit_min_ctx" || field == "flash_attn") {
             return INT;
@@ -1681,6 +1718,7 @@ struct test {
                                             std::to_string(fit_min_ctx),
                                             std::to_string(n_prompt),
                                             std::to_string(n_gen),
+                                            std::to_string(n_tg_step),
                                             std::to_string(n_depth),
                                             test_time,
                                             std::to_string(avg_ns()),
@@ -2059,6 +2097,10 @@ struct markdown_printer : public printer {
                     int len = strlen(buf);
                     snprintf(buf + len, sizeof(buf) - len, " @ d%d", t.n_depth);
                 }
+                if (t.n_gen > 0 && t.n_tg_step > 1) {
+                    int len = strlen(buf);
+                    snprintf(buf + len, sizeof(buf) - len, " @ v%d", t.n_tg_step);
+                }
                 value = buf;
             } else if (field == "t/s") {
                 snprintf(buf, sizeof(buf), "%.2f ± %.2f", t.avg_ts(), t.stdev_ts());
@@ -2159,23 +2201,42 @@ static bool test_prompt(llama_context * ctx, int n_prompt, int n_batch, int n_th
     return true;
 }
 
-static bool test_gen(llama_context * ctx, int n_gen, int n_threads) {
+static bool test_gen(llama_context * ctx, int n_gen, int n_threads, int n_tg_step) {
     llama_set_n_threads(ctx, n_threads, n_threads);
 
     const llama_model * model   = llama_get_model(ctx);
     const llama_vocab * vocab   = llama_model_get_vocab(model);
     const int32_t       n_vocab = llama_vocab_n_tokens(vocab);
 
-    llama_token token = llama_vocab_get_add_bos(vocab) ? llama_vocab_bos(vocab) : std::rand() % n_vocab;
+    // With n_tg_step > 1 each step decodes that many tokens of a single sequence at
+    // consecutive positions: the same query-batch shape as an MTP verify step. The
+    // first token seeds the step, the remaining ones are random "drafts" (fixed seed,
+    // so two binaries see an identical workload). All drafts are kept in the KV cache,
+    // i.e. the equivalent of a 100% acceptance rate, and logits are computed for all
+    // positions like the server does when verifying draft tokens.
+    std::vector<llama_token> tokens(std::max(1, n_tg_step));
+    std::vector<int8_t>      logits(std::max(1, n_tg_step), 1);
 
-    for (int i = 0; i < n_gen; i++) {
-        int res = llama_decode(ctx, llama_batch_get_one(&token, 1));
+    tokens[0] = llama_vocab_get_add_bos(vocab) ? llama_vocab_bos(vocab) : std::rand() % n_vocab;
+
+    for (int i = 0; i < n_gen; i += (int) tokens.size()) {
+        const int n_tokens = std::min((int) tokens.size(), n_gen - i);
+
+        for (int j = 1; j < n_tokens; j++) {
+            tokens[j] = std::rand() % n_vocab;
+        }
+
+        llama_batch batch = llama_batch_get_one(tokens.data(), n_tokens);
+        batch.logits = logits.data(); // positions are auto-generated by the batch allocator
+
+        int res = llama_decode(ctx, batch);
         if (res != 0) {
             fprintf(stderr, "%s: failed to decode generation batch, res = %d\n", __func__, res);
             return false;
         }
         llama_synchronize(ctx);
-        token = std::rand() % n_vocab;
+
+        tokens[0] = std::rand() % n_vocab;
     }
     return true;
 }
@@ -2387,7 +2448,7 @@ int llama_bench(int argc, char ** argv) {
                 if (params.progress) {
                     fprintf(stderr, "llama-bench: benchmark %d/%zu: warmup generation run\n", params_idx, params_count);
                 }
-                bool res = test_gen(ctx, 1, t.n_threads);
+                bool res = test_gen(ctx, t.n_tg_step, t.n_threads, t.n_tg_step);
                 if (!res) {
                     fprintf(stderr, "%s: error: failed to run gen warmup\n", __func__);
                     llama_free(ctx);
@@ -2457,7 +2518,7 @@ int llama_bench(int argc, char ** argv) {
                     fprintf(stderr, "llama-bench: benchmark %d/%zu: generation run %d/%d\n", params_idx, params_count,
                             i + 1, params.reps);
                 }
-                bool res = test_gen(ctx, t.n_gen, t.n_threads);
+                bool res = test_gen(ctx, t.n_gen, t.n_threads, t.n_tg_step);
                 if (!res) {
                     fprintf(stderr, "%s: error: failed to run gen\n", __func__);
                     llama_free(ctx);
