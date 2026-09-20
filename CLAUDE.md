@@ -21,10 +21,16 @@ cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=70
 # FA VEC 内核的量化组合, 默认已含 q4_0-q4_0;q8_0-q8_0;f16-f16;bf16-bf16 (ggml/CMakeLists.txt ~207)
 # 如需扩展: -DGGML_CUDA_FA_QUANTS="q8_0-q8_0;q4_0-q4_0;f16-f16;bf16-bf16"
 
-cmake --build build --target llama-bench llama-perplexity llama-cli -j
+cmake --build build --target llama-bench llama-batched-bench llama-perplexity llama-cli -j
 
 # decode 性能对比(fa 默认开; 对比 ctk/ctv f16 vs q8_0 vs q4_0)
 ./build/bin/llama-bench -m <model.gguf> -ngl 99 -p 512 -n 128 -fa 1 -ctk q8_0 -ctv q8_0
+
+# 单并发 verify 形状 A/B(本 fork 新增 -ntgs: 每步单序列连续 ntgs 个 token, logits 全 true,
+# 对齐 server MTP verify 的批次形状; 接受逗号列表如 -ntgs 1,2,3,4, 每 ntgs 值展开一行 tg 测试
+# (标签 tg128 @ v4); ntgs>=2 时 FA 走 TILE, ntgs=1 走 VEC 作对照;
+# 跨 ntgs 的 t/s 不可比——batch 化本身的收益会混入, 必须同 ntgs 对比两棵树)
+./build/bin/llama-bench -m <model.gguf> -ngl 99 -fa on -ctk q8_0 -ctv q8_0 -p 4096 -n 128 -ntgs 4 -r 3
 
 # 精度对拍(改造前后 perplexity 应逐位一致或极接近)
 ./build/bin/llama-perplexity -m <model.gguf> -ngl 99 -f <wiki.txt> -fa 1 -ctk q8_0 -ctv q8_0
@@ -101,7 +107,7 @@ nvidia-smi dmon -s um
 
 该模型在 V100 上的 FA 路由(注意与通用结论的差异):
 - 单序列 decode: 有效 batch 1x2=2 -> VEC, 量化直读, 无 staging(通用警告"gqa%4 落 TILE"对 6:1 不适用)
-- MTP verify(k>=2 个 draft)与多序列 decode: 有效 batch >=4 -> TILE -> staging 往返
+- MTP verify(k>=2 个 draft)与多序列 decode: 有效 batch >=4 -> TILE -> staging 往返(多序列仅限 -kvu unified KV; 默认 split KV n_stream=n_seq_max, split_equal 按序列拆 ubatch, 每个 FA 退化 1 行走 VEC, 2026-09-19 实测踩坑)
 - prefill: MMA_F16 -> staging 往返; 二次方增长, 64K 上下文时 staging 流量(~10.7GB/ubatch)与 tensor core 计算同级, full-attn prefill 被拖慢 1.7-2x
 
 针对性优化优先级:
@@ -116,8 +122,8 @@ nvidia-smi dmon -s um
   - 改造点: fattn-tile.cuh `flash_attn_tile_load_tile` 加 type_KV/elem0(K 与 V 共用此函数), q8_0 分支复用 fattn-common.cuh `dequantize_V_q8_0<half,2*cpy_ne>` 寄存器反量化写 shared; iter_KQ/iter/kernel 透传 type_K/type_V, q8_0 时 stride 保持字节单位; q8_0 行(34B 块)无法 half2 指针前移定位切片, K 尾段由 elem0 定位(F16 走指针前移, 互斥不重复计账)
   - 提交链: 4cddb5514(内核装载) 0d9531b73(分派/显存接入 + 实例文件)
   - 实例与分派: (256,256) x ncols2∈{1,2} x ncols1∈{1,2,4,8,16} 共 9 组(ncols2=1 时 ncols1 恒 >=2), 实例文件 fattn-tile-instance-dkq256-dv256-q8_0.cu(CMake GLOB 自动收编, 新文件需重新 configure); ncols2=4/8(gqa%4 模型)与 ncols1=32 暂回退 staging, 扩容=加 DECL + 放宽 `ggml_cuda_fattn_tile_q8_supported` 里两处检查
-  - 与 mma 分支的关键差异: supported()(fattn-tile.cu)是分派与 get_alloc_size 共用的唯一判定源, staging 恰好在被使用时才预留, 结构性规避 supported/alloc 镜像失配 bug 类; env GGML_CUDA_FA_TILE_QUANT_FALLBACK=1 强制回退(A/B 正控制)
-  - 验证状态: 构建通过(9 实例 + 符号已确认); 运行级验证未跑(本回合禁用 GPU)。正控制 = 设/不设 env 对比 compute buffer 尺寸(应差一个 staging)与 tg t/s, 命令: `llama-bench -m <模型> -ngl 99 -fa 1 -ctk q8_0 -ctv q8_0 -p 512 -n 128 -np 4`(-np 2/8 变体; 多序列 -> TILE); 数值上 load 反量化链与 staging 同一条 __hmul2, env 开/关生成文本应逐 token 一致
+  - 与 mma 分支的关键差异: supported()(fattn-tile.cu)是分派与 get_alloc_size 共用的唯一判定源, staging 恰好在被使用时才预留, 结构性规避 supported/alloc 镜像失配 bug 类; GGML_CUDA_FA_TILE_QUANT_FALLBACK env 已移除(2026-09-19, A/B 改用 /home/baigui/nvme/llama.cpp vanilla 树构建做跨二进制约); 路径进入确认 = ggml_cuda_flash_attn_ext_tile_case_q8 每实例(每 (ncols1,ncols2) 组合)首次被调度时往 stderr 打一行 fprintf
+  - 验证状态: [运行级 A/B 已跑 2026-09-19] 载具 llama-batched-bench, 必须加 -kvu(默认 split KV 按序列拆 ubatch, FA 退化 1 行走 VEC, 踩坑实录)且 -fa 新版参数是 on/off/auto: `./build/bin/llama-batched-bench -m <模型> -ngl 99 -fa on -ctk q8_0 -ctv q8_0 -kvu -c 16896 -npp 4096 -ntg 128 -npl 1,2,4`, 对照 = vanilla 树(/home/baigui/nvme/llama.cpp)同参数, 各 3 次: pl=1(VEC 对照) 27.96 vs 27.97 t/s 持平; pl=2 TILE(2,2) 49.53 vs 48.90 (+1.3%); pl=4 TILE(4,2) 68.81 vs 67.21 (+2.4%); 版本内重复性 <0.15%, 信号 10-30 倍于组内极差, 判定真实收益而非噪声; PP 两版持平(本分支未动 MMA)✓; 机制核对: pl=4/n_kv~16.9K 时消除的 staging 流量理论 ~2.2GB/step(~2.5ms@880GB/s), 实测省 1.39ms/step(~56%), 缺口即内核窄加载+反量化指令开销(上次指令经济性分析的预测, 归 P2); 收益 ∝ n_kv, 长上下文应继续放大(32K 变体: -npp 16000 -npl 1,2 -c 32768); 逐 token 数值一致性与 staging 显存回落待 server MTP 路径最终确认; pl=8(8,2) 实例未测(-c 16896 放不下, 需 33792); 单并发 verify 工况(llama-bench -ntgs, 见 Build/Bench 节)工具已就绪, 数据待跑
 - P2: 量化 decode 路由实验(VEC 只有 24 block, 占用率 30%; P1 后可试 TILE 分区+GQA 打包, 预期 3-5%)
 
 ## flash-attention-v100/ 参考库(只读)
