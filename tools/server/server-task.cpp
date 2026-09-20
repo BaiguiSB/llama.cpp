@@ -1602,6 +1602,33 @@ std::string server_task_result_metrics::to_metrics() {
     add_items("counter", counters);
     add_items("gauge",   gauges);
 
+    // labeled counters: one time series per processing stage
+    // note: these are host-side wall times, target/draft cover the GPU work as they wait for it
+    {
+        const std::pair<const char *, const server_stage *> stages[] = {
+            { "prefill", &metrics.st_prefill },
+            { "decode",  &metrics.st_decode  },
+            { "draft",   &metrics.st_draft   },
+            { "verify",  &metrics.st_verify  },
+            { "sample",  &metrics.st_sample  },
+            { "detok",   &metrics.st_detok   },
+        };
+
+        prometheus << "# HELP llamacpp:stage_seconds_total Total time spent in a stage of request processing\n"
+                   << "# TYPE llamacpp:stage_seconds_total counter\n";
+
+        for (const auto & [name, st] : stages) {
+            prometheus << "llamacpp:stage_seconds_total{stage=\"" << name << "\"} " << st->t_us / 1.e6 << "\n";
+        }
+
+        prometheus << "# HELP llamacpp:stage_runs_total Total number of runs of a stage of request processing\n"
+                   << "# TYPE llamacpp:stage_runs_total counter\n";
+
+        for (const auto & [name, st] : stages) {
+            prometheus << "llamacpp:stage_runs_total{stage=\"" << name << "\"} " << st->n << "\n";
+        }
+    }
+
     // labeled counter: one time series per draft position
     if (!metrics.n_accepted_per_pos.empty()) {
         prometheus << "# HELP llamacpp:spec_decode_num_accepted_tokens_per_pos_total"

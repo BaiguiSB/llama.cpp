@@ -78,6 +78,18 @@ json format_error_response(const std::string & message, const enum error_type ty
 }
 
 //
+// server_stage
+//
+
+json server_stage::to_json() const {
+    return json{
+        {"n",           n},
+        {"ms",          t_ms()},
+        {"ms_per_call", t_per_call_ms()},
+    };
+}
+
+//
 // server_slot_stats
 //
 
@@ -99,6 +111,29 @@ json server_slot_stats::to_json() const {
     if (n_draft_tokens > 0) {
         base["draft_n"]          = n_draft_tokens;
         base["draft_n_accepted"] = n_draft_accepted;
+    }
+
+    // stage breakdown, only the stages that actually ran
+    // note: the ms values here cover host-side wall time, which includes waiting for the GPU
+    json stages = json::object();
+
+    const std::pair<const char *, const server_stage *> all_stages[] = {
+        { "prefill", &st_prefill },
+        { "decode",  &st_decode  },
+        { "draft",   &st_draft   },
+        { "verify",  &st_verify  },
+        { "sample",  &st_sample  },
+        { "detok",   &st_detok   },
+    };
+
+    for (const auto & [name, st] : all_stages) {
+        if (st->n > 0) {
+            stages[name] = st->to_json();
+        }
+    }
+
+    if (!stages.empty()) {
+        base["stages"] = stages;
     }
 
     return base;

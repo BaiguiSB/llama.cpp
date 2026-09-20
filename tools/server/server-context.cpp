@@ -655,6 +655,36 @@ struct server_slot {
                 "   graphs reused = %10d\n",
                 llama_perf_context(ctx_tgt).n_reused);
 
+        // stage breakdown: total and per-run time of each stage that ran
+        // note: the stages are host-side wall times, they overlap with the timings above
+        {
+            std::string str_stages;
+
+            const std::pair<const char *, const server_stage *> all_stages[] = {
+                { "prefill", &stats.st_prefill },
+                { "decode",  &stats.st_decode  },
+                { "draft",   &stats.st_draft   },
+                { "verify",  &stats.st_verify  },
+                { "sample",  &stats.st_sample  },
+                { "detok",   &stats.st_detok   },
+            };
+
+            for (const auto & [name, st] : all_stages) {
+                if (st->n == 0) {
+                    continue;
+                }
+                if (!str_stages.empty()) {
+                    str_stages += ", ";
+                }
+                str_stages += string_format("%s = %.2f ms x %" PRIu64 " (%.2f ms/run)",
+                        name, st->t_ms(), st->n, st->t_per_call_ms());
+            }
+
+            if (!str_stages.empty()) {
+                SLT_INF(*this, "        stages = %s\n", str_stages.c_str());
+            }
+        }
+
         const int32_t n_draft_total       = stats.n_draft_tokens;
         const int32_t n_draft_accepted    = stats.n_draft_accepted;
         const int32_t n_draft_verif_steps = stats.n_draft_verif_steps;
@@ -3042,9 +3072,28 @@ private:
 
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
+            // note: measured inside the yield, otherwise the wait for the queue worker to drain
+            //       (which is not part of the draft) would be included
+            int64_t t_draft_us = 0;
+
             queue_tasks.yield_to_queue([&]() {
+                const int64_t t_start = ggml_time_us();
+
                 common_speculative_draft(spec.get());
+
+                t_draft_us = ggml_time_us() - t_start;
             });
+
+            // the draft model forward is synchronized internally (the draft sampler waits for the
+            // logits), so this covers the actual forward time and not just the enqueue
+            // note: the time is attributed to every slot that was drafted for, as they all waited for it
+            metrics.st_draft.add(t_draft_us);
+
+            for (auto * slot : drafting) {
+                if (slot->stats.is_set()) {
+                    slot->stats.st_draft.add(t_draft_us);
+                }
+            }
         }
 
         // make checkpoints if needed
@@ -3678,11 +3727,22 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
+
+        // time of the target model forward
+        // note: this covers the whole call, including the sync when one is done. llama_decode() is
+        //       not purely asynchronous - for large prompt batches it blocks on the GPU itself, so
+        //       this is meaningful even when nothing is synchronized
+        int64_t t_target_us = 0;
+
         queue_tasks.yield_to_queue([&]() {
+            const int64_t t_start = ggml_time_us();
+
             ret = llama_decode(ctx_tgt, batch_view);
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
+
+            t_target_us = ggml_time_us() - t_start;
         });
 
         if (ret != 0) {
@@ -3735,7 +3795,7 @@ private:
             return false; // retry with the updated n_batch
         } else {
             // success, apply batch metrics
-            metrics_post_decode(off, batch_view.n_tokens, has_output);
+            metrics_post_decode(off, batch_view.n_tokens, has_output, t_target_us);
         }
 
         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
@@ -3853,6 +3913,11 @@ private:
             llama_token id;
             {
                 scoped_timer timer(t_sampl, n_sampl);
+
+                // note: the sampler synchronizes the context before reading the logits, so this may
+                //       include the tail of the target model forward (see the comment below)
+                server_stage_timer st_timer(slot.stats.st_sample, &metrics.st_sample);
+
                 id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
             }
 
@@ -3874,9 +3939,13 @@ private:
             slot.stats.update_gen_last();
 
             completion_token_output result;
-            result.tok          = id;
-            result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
-            result.prob         = 1.0f; // TODO: set it here instead of doing inside populate_token_probs
+            result.tok  = id;
+            result.prob = 1.0f; // TODO: set it here instead of doing inside populate_token_probs
+            {
+                server_stage_timer st_timer(slot.stats.st_detok, &metrics.st_detok);
+
+                result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
+            }
 
             if (slot.task->params.sampling.n_probs > 0) {
                 populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, tok_idx);
@@ -3908,6 +3977,10 @@ private:
 
             // verify and try to accept the draft
             {
+                // note: covers the sampling of the draft positions plus a possible checkpoint restore
+                //       below, so it is the cost of verifying one draft, not of a single sample
+                server_stage_timer st_timer(slot.stats.st_verify, &metrics.st_verify);
+
                 common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
@@ -4000,9 +4073,13 @@ private:
             for (size_t i = 0; i < ids.size(); ++i) {
                 completion_token_output result;
 
-                result.tok          = ids[i];
-                result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
-                result.prob         = 1.0f; // set later
+                result.tok  = ids[i];
+                result.prob = 1.0f; // set later
+                {
+                    server_stage_timer st_timer(slot.stats.st_detok, &metrics.st_detok);
+
+                    result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
+                }
 
                 // TODO: set result.probs
 
@@ -4068,13 +4145,48 @@ private:
     }
 
     // has_output is computed by the caller, which also already synchronized the context if it is set
-    void metrics_post_decode(int32_t off, int32_t n_tokens, bool has_output) {
+    void metrics_post_decode(int32_t off, int32_t n_tokens, bool has_output, int64_t t_target_us) {
         metrics.n_decode++;
         for (const auto & slot : slots) {
             if (slot.is_processing()) {
                 metrics.n_busy_slots++;
             }
             metrics.n_tokens_max = std::max(metrics.n_tokens_max, (uint64_t) slot.prompt.n_tokens());
+        }
+
+        // record the target model forward time, split into prompt tokens and generated tokens
+        {
+            // a batch is normally either all prompt or all generated tokens
+            bool has_prompt = false;
+            for (int i = off; i < off + n_tokens; ++i) {
+                if (batch.tokens[i].is_prompt) {
+                    has_prompt = true;
+                    break;
+                }
+            }
+
+            // global metrics: one record per batch, not per slot in it
+            (has_prompt ? metrics.st_prefill : metrics.st_decode).add(t_target_us);
+
+            // per slot: the whole batch time is attributed to every slot that was part of the batch,
+            // as each of them had to wait for the full batch to complete
+            // note: tokens of the same slot are contiguous in the batch, see build_batch()
+            int32_t id_slot_prev = -1;
+
+            for (int i = off; i < off + n_tokens; ++i) {
+                const int32_t id_slot = batch.tokens[i].id_slot;
+
+                if (id_slot == id_slot_prev) {
+                    continue;
+                }
+                id_slot_prev = id_slot;
+                const bool is_prompt = batch.tokens[i].is_prompt;
+
+                auto & slot = slots[id_slot];
+                if (slot.stats.is_set()) {
+                    (is_prompt ? slot.stats.st_prefill : slot.stats.st_decode).add(t_target_us);
+                }
+            }
         }
 
         // apply enqueued prompt tokens stats

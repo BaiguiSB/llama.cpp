@@ -350,6 +350,50 @@ json format_response_rerank(
 // stats and metrics
 //
 
+// accumulator for the time spent in one stage of the request processing
+// note: stages that cover a whole batch (e.g. the target model forward) are recorded
+//       as-is for every slot that was part of that batch
+struct server_stage {
+    uint64_t n    = 0; // number of times this stage ran
+    int64_t  t_us = 0; // total time spent in this stage, in microseconds
+
+    void add(int64_t t) {
+        n++;
+        t_us += t;
+    }
+
+    double t_ms() const {
+        return t_us / 1000.0;
+    }
+
+    // average duration of a single run of this stage, in ms
+    double t_per_call_ms() const {
+        return n > 0 ? t_ms() / n : 0.0;
+    }
+
+    json to_json() const;
+};
+
+// measures the time between construction and destruction, and adds it to the stage on destruction
+// note: the destructor runs on early return as well, so the partial work is still accounted for
+struct server_stage_timer {
+    server_stage & st;
+    server_stage * st_global; // optional, recorded too (used for stages that are per-slot but global in metrics)
+    const int64_t  t_start;
+
+    explicit server_stage_timer(server_stage & st, server_stage * st_global = nullptr)
+        : st(st), st_global(st_global), t_start(ggml_time_us()) {}
+
+    ~server_stage_timer() {
+        const int64_t t_us = ggml_time_us() - t_start;
+
+        st.add(t_us);
+        if (st_global != nullptr) {
+            st_global->add(t_us);
+        }
+    }
+};
+
 // shared between server_slot and server_task_result_*
 struct server_slot_stats {
     uint64_t n_prompt_cached    = 0;
@@ -361,6 +405,16 @@ struct server_slot_stats {
     uint64_t n_draft_tokens      = 0;
     uint64_t n_draft_accepted    = 0;
     uint64_t n_draft_verif_steps = 0;
+
+    // stage timings
+    // note: only the target forward covers the GPU directly - the other stages are host-side work
+    //       that may still block on the GPU (e.g. sampling waits for the logits)
+    server_stage st_prefill; // target model forward, prompt tokens: llama_decode() + sync
+    server_stage st_decode;  // target model forward, generated tokens: llama_decode() + sync
+    server_stage st_draft;   // speculative draft generation
+    server_stage st_verify;  // speculative verification and acceptance of the draft
+    server_stage st_sample;  // sampling
+    server_stage st_detok;   // detokenization
 
     // these are absolute timestamps (in us)
     // note: must be signed - they are subtracted before the later ones are set
@@ -480,6 +534,16 @@ struct server_metrics {
     uint64_t n_draft_accepted    = 0; // Draft tokens actually accepted
     uint64_t n_draft_verif_steps = 0; // Total draft token verification steps by the target model
     std::vector<uint64_t> n_accepted_per_pos; // Accepted tokens per draft position
+
+    // cumulative stage timings
+    // note: recorded at the point where the stage runs, so a stage that covers a shared batch
+    //       (target forward, draft) is counted once per batch, not once per slot in it
+    server_stage st_prefill;
+    server_stage st_decode;
+    server_stage st_draft;
+    server_stage st_verify;
+    server_stage st_sample;
+    server_stage st_detok;
 
     void init() {
         t_start = ggml_time_us();
