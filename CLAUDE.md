@@ -33,6 +33,76 @@ cmake --build build --target llama-bench llama-perplexity llama-cli -j
 nvidia-smi dmon -s um
 ```
 
+## 性能基准: 分阶段耗时 (2026-09-20 实测)
+
+server 已内置分阶段计时 (server-common.h `server_stage`), 三处输出:
+- API `timings.stages.<stage>` = `{n, ms, ms_per_call}`
+- `/metrics` `stage_seconds_total{stage=...}` / `stage_runs_total{stage=...}`
+- 日志 `stages = prefill = ... ms x N (... ms/run), ...`
+
+阶段: `prefill` / `decode` / `draft` / `verify` / `sample` / `detok`。前两个是 target
+前向, 按 batch 内 `is_prompt` 拆分。取数(server 需带 `--metrics`):
+
+```sh
+curl -s localhost:8080/completion -H 'Content-Type: application/json' \
+  -d '{"prompt":"...","n_predict":128,"cache_prompt":true,"ignore_eos":true}' | jq .timings
+curl -s localhost:8080/metrics | grep '^llamacpp:stage_'
+```
+
+### 测试配置与结果
+
+Qwen3.8-27B Q4_K_M + mtp-Q4_0, `-fa on -ctk q8_0 -ctv q8_0 --spec-type draft-mtp
+--spec-draft-n-max 3 --parallel 1 --ctx-size 64000`
+
+单个 decode step (稳态 ~58 ms):
+
+| 阶段 | ms/step | 占比 |
+|---|---|---|
+| decode forward | 50.0 | **86.6%** |
+| draft (MTP) | 5.5 | 9.4% |
+| verify | 1.5 | 2.6% |
+| 其余 (建 batch / 采样 / 发响应) | 1.2 | 2.0% |
+
+per token: forward 20.5-24.4 ms, draft 2.2-2.7, verify 0.65, detok ~0.001
+→ 合计 23.8-27.8 ms/token (实测 35-41 t/s)。
+
+MTP: 每 step 产出 2.33 token (接受率 0.439, mean len 2.30; 按位置 0.664/0.388/0.250),
+draft+verify 花 6.9 ms 换 1.33 个额外 token, 对照估算 ≥2.0x (无 spec 的对照尚未实测)。
+**即使 draft+verify 优化到 0 也只到 ~46 t/s (+16%), 优化重心应在 target forward。**
+
+prefill 线性/二次分解 (14252 token 的 prompt, 7 个进度点拟合, 残差 <0.4%):
+
+```
+T(N) = 0.334 + 1.1127e-3*N + 1.847e-8*N^2   (秒, N = prompt token 数)
+       ↑常量      ↑线性(权重/MLP)    ↑二次(注意力)
+```
+
+| N | 注意力占比 | 实测速率 |
+|---|---|---|
+| 4096 | 6.0% | 792 t/s |
+| 14252 | 18.8% | 712 t/s |
+| 32000 (外推) | 34.5% | — |
+| 64000 (外推) | 51.4% | — |
+
+单点: 14252 token = 20457 ms (697 t/s), 其中 prefill stage 17827 ms (87%)。prefill 期间
+nvidia-smi 全程 99-100% util / ~240W → **GPU 受限**, 佐证 P0 的 FA 优化方向。
+
+### 阶段覆盖不到的部分 (优化时注意)
+
+- **缓存命中时 `prompt_ms` 的 75-85% 不是计算**: 14252 token 上下文时 `prompt_ms`
+  359.5 ms 但 prefill stage 只有 66.6 ms, 差的 293 ms 是 checkpoint 恢复 / KV 回滚 /
+  建 batch / sampler init。目前无 stage 覆盖, 长上下文 + cache_prompt 场景值得单独看。
+- 每 step 约 1.2 ms (2%) 在 stage 外: `pre_decode` + `post_decode` + 队列 drain。
+
+### 方法学 (踩过的坑)
+
+- 微秒级阶段 (detok/sample) 单次采样不可信: 同一 prompt 读数在 0.0006 与 0.46 ms/token
+  之间跳 (700x), 是 CPU 调度噪声。用累计值或中位数。
+- 计时必须在 `yield_to_queue` 的 lambda 内: 该函数在 work() 返回后还会等队列 worker
+  排空, 在外层计时会把队列等待算进来。
+- 不能按 "是否 sync 过" 过滤 `llama_decode` 计时: 大 prompt batch 它是阻塞的, 过滤会让
+  prefill 只剩 0.3% (修正后 87%)。详见 commit `efded36ad`。
+
 ## CUDA FlashAttention 子系统结构
 
 入口与路由: `ggml/src/ggml-cuda/fattn.cu`
