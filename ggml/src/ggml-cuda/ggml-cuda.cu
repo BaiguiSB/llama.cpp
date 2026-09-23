@@ -4430,7 +4430,15 @@ void ggml_cuda_dequant_pipeline::on_node(int node_idx) {
         next_consume++;
     }
 
-    while (next_issue < candidates.size()) {
+    // Only convert weights whose own node the loop has reached. The conversion of candidate j is then
+    // enqueued after the launch of the GEMM of node j-1 (the GEMM it should hide under) and before
+    // its consumer GEMM of node j. Enqueueing earlier is actively harmful on this hardware: the block
+    // dispatcher hands out blocks in launch order, so a giant-grid dequant enqueued before a GEMM
+    // occupies every SM block slot until its grid drains and starves the already-ready GEMM (nsys:
+    // 1.5% overlap with correct event topology, kernel durations unchanged, host 200 ms ahead of the
+    // GPU). With this ordering the GEMM's blocks are resident first and the dequant fills the slots
+    // the GEMM leaves free.
+    while (next_issue < candidates.size() && candidates[next_issue].node_idx <= node_idx) {
         int free_slot = -1;
         for (int i = 0; i < (int) slots.size(); ++i) {
             if (slots[i].src0 == nullptr) {
