@@ -1489,9 +1489,7 @@ struct ggml_cuda_dequant_pipeline {
     size_t next_issue   = 0;
     size_t next_consume = 0;
     size_t slot_bytes   = 0;  // size of the staging buffers
-    int    n_pending    = 0;  // conversions issued but not consumed yet
     bool   active       = false;
-    bool   skip         = false;  // debug: leave the staging buffer stale, so that a wrong result proves the path is used
 
     ~ggml_cuda_dequant_pipeline() {
         for (slot & s : slots) {

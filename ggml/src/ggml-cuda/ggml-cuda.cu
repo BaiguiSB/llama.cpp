@@ -4226,6 +4226,15 @@ static size_t ggml_cuda_dequant_pipeline_max_bytes() {
     return max_bytes;
 }
 
+// debug: leave the staging buffer stale, so that a wrong result proves the path is used
+static bool ggml_cuda_dequant_pipeline_skip() {
+    static const bool skip = [] {
+        const char * env = getenv("GGML_CUDA_DEQUANT_PIPELINE_SKIP");
+        return env != nullptr && atoi(env) == 1;
+    }();
+    return skip;
+}
+
 // Would ggml_cuda_mul_mat() take the cuBLAS branch for this node? A false positive only wastes one
 // conversion into a staging buffer, so the predicates used by the dispatcher are enough.
 static bool ggml_cuda_mul_mat_uses_cublas(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst, int cc, int warp_size) {
@@ -4257,6 +4266,24 @@ static void ggml_cuda_dequant_pipeline_scan(ggml_backend_cuda_context & ctx, ggm
     const ggml_cuda_device_info & info = ggml_cuda_info();
     const int cc        = info.devices[ctx.device].cc;
     const int warp_size = info.devices[ctx.device].warp_size;
+
+    // Cheap prefilter so that graphs without pipelined weights (decode, MTP draft/verify) exit before
+    // the written-set is built: on this hardware the cuBLAS path for a quantized src0 needs
+    // ne11 >= MMQ_DP4A_MAX_BATCH_SIZE (below that MMVQ/MMQ handle it). The condition is a superset
+    // filter only, a node excluded here just stays on the inline conversion path.
+    bool has_pipelined_mul_mat = false;
+    for (int i = 0; i < cgraph->n_nodes && !has_pipelined_mul_mat; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        const ggml_tensor * src0 = node->src[0];
+        const ggml_tensor * src1 = node->src[1];
+        has_pipelined_mul_mat = node->op == GGML_OP_MUL_MAT
+            && src0 != nullptr && src1 != nullptr
+            && ggml_is_quantized(src0->type)
+            && src1->ne[1] >= MMQ_DP4A_MAX_BATCH_SIZE;
+    }
+    if (!has_pipelined_mul_mat) {
+        return;
+    }
 
     // only tensors that are not written by this graph can be read ahead of their node
     std::unordered_set<const ggml_tensor *> written;
@@ -4302,7 +4329,6 @@ static void ggml_cuda_dequant_pipeline_convert(const ggml_tensor * src0, void * 
 void ggml_cuda_dequant_pipeline::begin(ggml_backend_cuda_context & ctx, std::vector<candidate> && cand) {
     active = false;
     candidates.clear();
-    slots.clear();
     next_issue   = 0;
     next_consume = 0;
     slot_bytes   = 0;
@@ -4320,10 +4346,12 @@ void ggml_cuda_dequant_pipeline::begin(ggml_backend_cuda_context & ctx, std::vec
     }
     {
         // the pipeline stages F16 data, a different compute type would need a different staging buffer
-        const char * env = getenv("GGML_CUDA_CUBLAS_COMPUTE_TYPE");
-        const std::string compute_type = env != nullptr ? env : "auto";
+        static const std::string compute_type = [] {
+            const char * env = getenv("GGML_CUDA_CUBLAS_COMPUTE_TYPE");
+            return std::string(env != nullptr ? env : "auto");
+        }();
         if (compute_type != "auto" && compute_type != "f16" && compute_type != "fp16") {
-            GGML_LOG_DEBUG("%s: disabled, GGML_CUDA_CUBLAS_COMPUTE_TYPE is %s\n", __func__, env);
+            GGML_LOG_DEBUG("%s: disabled, GGML_CUDA_CUBLAS_COMPUTE_TYPE is %s\n", __func__, compute_type.c_str());
             return;
         }
     }
@@ -4339,7 +4367,6 @@ void ggml_cuda_dequant_pipeline::begin(ggml_backend_cuda_context & ctx, std::vec
     }
 
     candidates = std::move(cand);
-    skip = getenv("GGML_CUDA_DEQUANT_PIPELINE_SKIP") != nullptr;
 
     prefetch_stream = ctx.stream(ctx.device, prefetch_stream_no);
     if (fork_event == nullptr) {
@@ -4349,6 +4376,10 @@ void ggml_cuda_dequant_pipeline::begin(ggml_backend_cuda_context & ctx, std::vec
         CUDA_CHECK(cudaEventCreateWithFlags(&join_event, cudaEventDisableTiming));
     }
 
+    // The slots and their events persist across graph computes: recreating the events every begin()
+    // would leak the old ones, and an older cudaGraphExec_t may still reference them. Only the pool
+    // memory is reallocated (LIFO: allocated first, freed last in end()). The slot count is fixed by
+    // the environment, so the events are created exactly once.
     slots.resize(ggml_cuda_dequant_pipeline_n_slots());
     for (slot & s : slots) {
         if (s.ready == nullptr) {
@@ -4357,9 +4388,11 @@ void ggml_cuda_dequant_pipeline::begin(ggml_backend_cuda_context & ctx, std::vec
         if (s.done == nullptr) {
             CUDA_CHECK(cudaEventCreateWithFlags(&s.done, cudaEventDisableTiming));
         }
-        if (s.ptr == nullptr) {
-            s.ptr = ctx.pool().alloc(slot_bytes, &s.bytes);
-        }
+        GGML_ASSERT(s.ptr == nullptr);
+        s.ptr      = ctx.pool().alloc(slot_bytes, &s.bytes);
+        s.src0     = nullptr;
+        s.in_use   = false;
+        s.consumed = false;
     }
 
     // Seed the events on the compute stream: while capturing, a wait on an event without a record inside
@@ -4417,7 +4450,7 @@ void ggml_cuda_dequant_pipeline::on_node(int node_idx) {
             s.consumed = false;
         }
 
-        if (!skip) {
+        if (!ggml_cuda_dequant_pipeline_skip()) {
             ggml_cuda_dequant_pipeline_convert(c.src0, s.ptr, prefetch_stream);
         }
         CUDA_CHECK(cudaEventRecord(s.ready, prefetch_stream));
@@ -4471,9 +4504,10 @@ void ggml_cuda_dequant_pipeline::end(ggml_backend_cuda_context & ctx) {
             ctx.pool().free(s.ptr, s.bytes);
             s.ptr = nullptr;
         }
-        s.bytes  = 0;
-        s.src0   = nullptr;
-        s.in_use = false;
+        s.bytes    = 0;
+        s.src0     = nullptr;
+        s.in_use   = false;
+        s.consumed = false;
     }
 
     active = false;
