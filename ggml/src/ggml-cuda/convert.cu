@@ -413,6 +413,92 @@ static void dequantize_row_nvfp4_cuda(
     const int nb = k / QK_NVFP4;
     dequantize_block_nvfp4<<<nb, 32, 0, stream>>>(vx, y, k);
 }
+
+//================================== persistent capped-grid k-quants (prefill pipeline)
+
+// Capped-grid variants of the k-quant conversions for the prefill dequant pipeline: a fixed
+// number of 256-thread blocks loops over the superblocks instead of one tiny block per superblock
+// (e.g. 348160 x 32 threads for a (5120,17408) weight). Each lane group calls the same device
+// function with the same (ib, tid) mapping as one native block, hence the output is bitwise
+// identical. Only used by the pipeline; all other paths keep the native kernels.
+//
+// Measured on V100 (CAP sweep, pp4096@d4096): capping the grid does NOT unlock overlap with the
+// cuBLAS GEMM. cutlass s884gemm_f16_128x128 uses 236 regs x 128 threads = 30720 regs/block and
+// co-resides 2 blocks/SM = 61440 of the 65536-register file; the 4096-register remainder fits
+// no 256-thread block (>= 8192 regs), so a conversion can never join a running GEMM wave at any
+// cap. What the cap does control is standalone speed: 640 blocks (8/SM) matches the native grid
+// (733 vs 729 t/s), 320 costs ~4%, 160 ~7%. Kept (default off, cap=0) as the carrier for P0
+// kernel-efficiency work; see CLAUDE.md "prefill dequant 跨流重叠流水线".
+
+#define CUDA_PERSISTENT_DEQUANT_BLOCK_SIZE 256
+
+template<typename dst_t>
+static __global__ void dequantize_block_q4_K_ps(const void * __restrict__ vx, dst_t * __restrict__ yy, const int64_t nb) {
+    const int     tid    = threadIdx.x % 32; // native q4_K blocks are 32 threads
+    const int64_t stride = (int64_t) gridDim.x * (CUDA_PERSISTENT_DEQUANT_BLOCK_SIZE / 32);
+
+    for (int64_t i = (int64_t) blockIdx.x * (CUDA_PERSISTENT_DEQUANT_BLOCK_SIZE / 32) + threadIdx.x / 32; i < nb; i += stride) {
+        dequantize_q4_K(vx, i, yy + i*QK_K, tid);
+    }
+}
+
+template<typename dst_t>
+static __global__ void dequantize_block_q5_K_ps(const void * __restrict__ vx, dst_t * __restrict__ yy, const int64_t nb) {
+    const int     tid    = threadIdx.x % 64; // native q5_K blocks are 64 threads
+    const int64_t stride = (int64_t) gridDim.x * (CUDA_PERSISTENT_DEQUANT_BLOCK_SIZE / 64);
+
+    for (int64_t i = (int64_t) blockIdx.x * (CUDA_PERSISTENT_DEQUANT_BLOCK_SIZE / 64) + threadIdx.x / 64; i < nb; i += stride) {
+        dequantize_q5_K(vx, i, yy + i*QK_K, tid);
+    }
+}
+
+template<typename dst_t>
+static __global__ void dequantize_block_q6_K_ps(const void * __restrict__ vx, dst_t * __restrict__ yy, const int64_t nb) {
+    const int     tid    = threadIdx.x % 64; // native q6_K blocks are 64 threads
+    const int64_t stride = (int64_t) gridDim.x * (CUDA_PERSISTENT_DEQUANT_BLOCK_SIZE / 64);
+
+    for (int64_t i = (int64_t) blockIdx.x * (CUDA_PERSISTENT_DEQUANT_BLOCK_SIZE / 64) + threadIdx.x / 64; i < nb; i += stride) {
+        dequantize_q6_K(vx, i, yy + i*QK_K, tid);
+    }
+}
+
+template<typename dst_t>
+static void dequantize_row_q4_K_ps_cuda(const void * vx, dst_t * y, const int64_t k, const int64_t cap, cudaStream_t stream) {
+    const int64_t nb = k / QK_K;
+    dequantize_block_q4_K_ps<<<(int)std::min(nb, cap), CUDA_PERSISTENT_DEQUANT_BLOCK_SIZE, 0, stream>>>(vx, y, nb);
+}
+
+template<typename dst_t>
+static void dequantize_row_q5_K_ps_cuda(const void * vx, dst_t * y, const int64_t k, const int64_t cap, cudaStream_t stream) {
+    const int64_t nb = k / QK_K;
+    dequantize_block_q5_K_ps<<<(int)std::min(nb, cap), CUDA_PERSISTENT_DEQUANT_BLOCK_SIZE, 0, stream>>>(vx, y, nb);
+}
+
+template<typename dst_t>
+static void dequantize_row_q6_K_ps_cuda(const void * vx, dst_t * y, const int64_t k, const int64_t cap, cudaStream_t stream) {
+    const int64_t nb = k / QK_K;
+    dequantize_block_q6_K_ps<<<(int)std::min(nb, cap), CUDA_PERSISTENT_DEQUANT_BLOCK_SIZE, 0, stream>>>(vx, y, nb);
+}
+
+bool ggml_cuda_dequant_f16_persistent(ggml_type type, const void * vx, half * y, const int64_t k, const int64_t cap, cudaStream_t stream) {
+    if (cap <= 0 || k <= 0) {
+        return false;
+    }
+    switch (type) {
+        case GGML_TYPE_Q4_K:
+            dequantize_row_q4_K_ps_cuda(vx, y, k, cap, stream);
+            return true;
+        case GGML_TYPE_Q5_K:
+            dequantize_row_q5_K_ps_cuda(vx, y, k, cap, stream);
+            return true;
+        case GGML_TYPE_Q6_K:
+            dequantize_row_q6_K_ps_cuda(vx, y, k, cap, stream);
+            return true;
+        default:
+            return false;
+    }
+}
+
 template <typename src_t, typename dst_t>
 static __global__ void convert_unary(
         const void * __restrict__ vx, dst_t * __restrict__ y, const int64_t ne00, const int64_t ne01,

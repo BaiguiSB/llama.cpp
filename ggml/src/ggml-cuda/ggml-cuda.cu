@@ -4235,6 +4235,20 @@ static bool ggml_cuda_dequant_pipeline_skip() {
     return skip;
 }
 
+// Grid cap for the persistent dequant kernels (q4_K/q5_K/q6_K), see convert.cu. Measured on V100:
+// capping the grid does not unlock overlap -- the cutlass GEMM co-resides 2 blocks/SM at 236 regs
+// x 128 threads = 61440 of the 65536 regs/SM, and the 4096-register remainder fits no 256-thread
+// dequant block -- and the persistent kernels are slower standalone below cap 640 (t/s: cap 0 =
+// 728.7, 160 = 676.0, 320 = 701.3, 480 = 717.3, 640 = 733.3). Default 0 = off, restoring the
+// original launches; kept as an A/B knob and as the carrier for P0 kernel-efficiency work.
+static int64_t ggml_cuda_dequant_pipeline_persistent_blocks() {
+    static const int64_t blocks = [] {
+        const char * env = getenv("GGML_CUDA_DEQUANT_PERSISTENT_BLOCKS");
+        return (int64_t) std::max(0, env != nullptr ? atoi(env) : 0);
+    }();
+    return blocks;
+}
+
 // Would ggml_cuda_mul_mat() take the cuBLAS branch for this node? A false positive only wastes one
 // conversion into a staging buffer, so the predicates used by the dispatcher are enough.
 static bool ggml_cuda_mul_mat_uses_cublas(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst, int cc, int warp_size) {
@@ -4321,6 +4335,13 @@ static void ggml_cuda_dequant_pipeline_scan(ggml_backend_cuda_context & ctx, ggm
 }
 
 static void ggml_cuda_dequant_pipeline_convert(const ggml_tensor * src0, void * dst, cudaStream_t stream) {
+    // capped-grid persistent kernels first when enabled (q4_K/q5_K/q6_K, bitwise identical).
+    // Default cap 0 = off: measured slower standalone with no overlap gain (register-file
+    // exclusion, see convert.cu). Unsupported types (q8_0 etc.) use the native conversion.
+    if (ggml_cuda_dequant_f16_persistent(src0->type, src0->data, (half *) dst, ggml_nelements(src0),
+                                         ggml_cuda_dequant_pipeline_persistent_blocks(), stream)) {
+        return;
+    }
     const auto convert_func = batched_mul_mat_traits<GGML_TYPE_F16>::convert(src0->type);
     GGML_ASSERT(convert_func != nullptr);
     convert_func(src0->data, (half *) dst, ggml_nelements(src0), stream);

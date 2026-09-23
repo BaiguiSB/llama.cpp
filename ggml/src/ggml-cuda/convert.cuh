@@ -16,6 +16,14 @@ to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type);
 
 to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type);
 
+// Capped-grid persistent F16 dequant for the prefill dequant pipeline (q4_K/q5_K/q6_K only).
+// Launches min(k/QK_K, cap) fixed 256-thread blocks instead of one tiny block per superblock;
+// output is bitwise identical to the native kernels. Returns false without launching for
+// unsupported types or cap <= 0, so callers fall back to ggml_get_to_fp16_cuda(). Measured:
+// the cap does not enable stream overlap (the GEMM's register footprint leaves no room for any
+// 256-thread block, see convert.cu) and slows the conversion below cap 640; default off.
+bool ggml_cuda_dequant_f16_persistent(ggml_type type, const void * vx, half * y, int64_t k, int64_t cap, cudaStream_t stream);
+
 // TODO more general support for non-contiguous inputs
 
 template<typename T>

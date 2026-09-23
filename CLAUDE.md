@@ -401,7 +401,7 @@ prefill 期间 nvidia-smi 全程 99-100% util / ~240W → GPU 受限属实(nsys 
 
 | 优先级 | 动作 | 预期 | 依据 |
 |---|---|---|---|
-| **P0** | `dequantize_block_*` 提速(提高每线程工作量 / streaming store 绕 write-allocate) | prefill **+10~15%** | 52.1 GiB/ubatch 只跑出 330-578 GB/s; 32 线程/块 |
+| **P0** | `dequantize_block_*` 提速(提高每线程工作量 / streaming store 绕 write-allocate) | prefill **+10~15%** | 52.1 GiB/ubatch 只跑出 330-578 GB/s; 32 线程/块;重叠路线已证伪, 这是 dequant 唯一剩余方向(见下文专节) |
 | **P1** | FA prefill 占用率(降 smem 或调 nbatch 让每 SM 驻留 >1 block) | prefill **+10%** | smem 67584B 卡成 1 block/SM, 4/64 warp, 31% TC 利用率 |
 | **P2** | VEC 的 GQA 去重(6:1 共享 KV); 可结合 TILE 分区打包 | decode **长上下文 +25%**, 短上下文 +6% | 858 GB/s 已打满, 2.62ms 里 5/6 是冗余 |
 | P3 | 融合 433 次 `quantize_q8_1` + 305 次 `rms_norm`(grid 只有 1~48 block, 纯延迟) | decode +3~4% | 每内核 2.6-7.2 µs, 与 mmv 严格一对一 |
@@ -414,6 +414,62 @@ prefill 期间 nvidia-smi 全程 99-100% util / ~240W → GPU 受限属实(nsys 
   - 实例与分派: (256,256) x {(16,2),(32,2),(32,1),(64,1)}, fattn.cu `ggml_cuda_flash_attn_ext_mma_f16_q8_supported()`: D=256 + q8_0-q8_0 + 上述 4 组合, 否则逐调用静默回退 F16+staging; env GGML_CUDA_FA_MMA_QUANT_FALLBACK=1 强制回退(做 A/B 正控制用)
   - 本模型实际进入情况: prefill ubatch(512 行) -> (32,2) 实例命中; Q 行数 <=8 的尾巴 ubatch -> (8,2) 未实例化逐调用回退(supported() 与 alloc_size 互为镜像, 无显存错配)
   - 验证方法论(重要): q8_0 与 baseline 的 PPL 逐位一致是设计预期(load_tile 反量化链与 convert.cu dequantize_block_q8_0_f16 是同一条 __hmul2), 因此 PPL 对拍既不能证明路径进入也不能证伪; 正控制 = 同一二进制设/不设 GGML_CUDA_FA_MMA_QUANT_FALLBACK 对比 compute buffer 大小(应差一个 staging)与 eval 时间。2026-09-17 实测 PPL 均值方差与 baseline 完全一致, 正控制待跑
+- **prefill dequant 跨流重叠流水线(六轮, 2026-09-23 证伪, 分支 `v100/perfill-pipeline`)**:
+  寄存器堆互斥 —— cutlass GEMM 236 regs × 128 线程自共驻 2 块/SM 吃掉 94% 寄存器堆,
+  剩 4096 regs 放不进任何 256 线程 dequant 块, 任何 grid 上限下共驻都物理不可行。详见下节。
+
+## prefill dequant 跨流重叠流水线 — 证伪复盘 (2026-09-23, 分支 v100/perfill-pipeline)
+
+设想: cuBLAS 路径每次 prefill mul_mat 全量 dequant 权重 → F16 staging (~200 ms/ubatch, 23.5%),
+用旁路 stream (s15) 预取下一个权重, 与主流 cutlass GEMM (~430 ms/ubatch) 重叠。
+SKIP 正控制(staging 留脏不转换)天花板 1044 t/s vs baseline 727 → 可藏的 dequant 时间值 +43%。
+
+六轮修复, bench 始终 ≈727 t/s:
+
+| 轮 | 修复 | commit | 结果 |
+|---|---|---|---|
+| 1 | 流水线骨架(VMM slot + 轮换 event + prefetch stream) | 9332a8070 / 49ae4b069 | 重叠率 1.5% |
+| 2 | ready/done event 按代轮换(等待未决时重 record, wait 静默跟最新 record → 隐式串行化) | 2eeea937e | 零增益 |
+| 3 | 发射顺序: dequant(j) 在 GEMM(j-1) launch 后才入队 | 39b19d6f8 | 零增益 |
+| 4 | nsys v2 诊断: first-free 槽复用把依赖压成距离 1(dequant(j) 等 done(j-1)) | — | 定位 |
+| 5 | slot 轮换恢复距离 2(dequant(j) 只等 done(j-2)) | 07f84b058 | 仍串行 |
+| 6 | 限 grid 持久化 dequant 内核(256 线程/块 grid-stride)+ CAP 扫描 | 本次提交 | **任何 CAP 零重叠** |
+
+CAP 扫描(pp4096 @ d4096, graphs off, env `GGML_CUDA_DEQUANT_PERSISTENT_BLOCKS`):
+
+| cap | 0(原生巨 grid 对照) | 160 | 320 | 480 | 640 |
+|---|---|---|---|---|---|
+| t/s | 728.7 | 676.0 | 701.3 | 717.3 | 733.3 |
+
+cap=0 精确复现基线(正控制成立); cap 单调恢复 ⇒ 持久化内核确实进入、grid 上限确实生效;
+差值全部由"dequant 单独跑变慢"解释(warp 数减半 + grid-stride 循环开销 ~14%), 无一档向 900+ 跳变。
+
+**根因(决定性, 来自 CUPTI `registersPerThread` 实测而非推测): 寄存器堆互斥, 不是 block slot。**
+
+- 主力 GEMM `cutlass_70_tensorop_s884gemm_f16_128x128_tn_align8`(grid 32×17×2 = 1088 块,
+  avg 1163 µs): **236 regs × 128 线程**, 按 warp 粒度 256 取整 = 30720 regs/块, smem 32KB
+  → 自身最优共驻 **2 块/SM = 61440 / 65536 regs(94%)**, 每个 SM 只剩 **4096 regs**
+- 任何 256 线程 dequant 块 ≥ 8192 regs ⇒ **物理上塞不进正在跑的 GEMM 波次**, 与 CAP 无关;
+  GEMM 块退休腾出的资源立刻被它自己 6.8 波 grid 的下一波回收(发射顺序贪心)
+- 4096 缝隙恰好放 4 个原生 32 线程 q4_K warp(27 regs → 1024/warp)。但 ① Volta 分发器是否
+  跨 stream 回填小缝隙未验证; ② 即使回填, 4/32 warp ⇒ dequant 在 GEMM 窗口内只推进 ~27%,
+  收益天花板 ≈ +8% (~785 t/s); ③ 共驻预算要求 ≤32 regs/线程, 与快速 P0 内核不相容
+  (q4_K 一个超块 144B 的载入缓冲就要 ~9×uint4 ≈ 36 regs) ⇒ 不值得做
+- 第 2-5 轮修的 event 拓扑/发射顺序/依赖距离都是必要非充分: 第二轮"巨 grid 独占 block slot"
+  只是表象, 真正锁死共驻的是 GEMM 自身的寄存器占用
+
+**结论: 重叠路线按 plan 预注册判据终止。dequant 唯一剩余方向 = P0 纯提效**(宽载入 + `__stcs`
+流式写, 串行全占用下直接生效, 预期 +10~15%)。持久化内核机制保留在树上: env 默认 0=关,
+cap=640 对原生巨 grid 实测中性(733 vs 729), 可直接当 P0 改造载体。
+
+方法学沉淀:
+- **PPL 对拍不能证明路径进入** —— 每个实验开关必须配正控制(本路线: SKIP、cap=0 vs >0)
+- 依赖距离判别: 数"绑定的 done-record 与 wait 之间发生了多少次 GEMM launch"(0 = 距离-1 特征);
+  "绑定的 record 是几代前"这个指标在距离 1 和距离 2 世界里都返回 0, 无判别力(第二轮误判教训)
+- CUPTI KERNEL 表带 registersPerThread / static+dynamicSharedMemory / grid+block 维度:
+  共驻可行性可以纯算术判定, 无需跑新 profile(本轮根因即由此得出, 未跑 nsys v3)
+- "GEMM 不要去动它"新增一层含义: GEMM 的 2 块/SM 共驻偏好是它 82% 峰值效率的前提,
+  换小 tile / 低寄存器内核来给 dequant 腾共驻缝隙, 损失会大于重叠收益
 
 ## flash-attention-v100/ 参考库(只读)
 
