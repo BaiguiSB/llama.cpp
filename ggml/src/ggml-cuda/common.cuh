@@ -1460,13 +1460,12 @@ struct ggml_backend_cuda_context;
 // Only weights that are not written by the graph being computed can be converted early.
 struct ggml_cuda_dequant_pipeline {
     struct slot {
-        void *              ptr      = nullptr;  // F16 staging buffer, pool memory
-        size_t              bytes    = 0;        // size of the pool allocation
-        const ggml_tensor * src0     = nullptr;  // weight staged in the buffer, null when the buffer is free
-        bool                in_use   = false;    // the GEMM reading the buffer was submitted
-        bool                consumed = false;    // the GEMM reading the buffer was submitted at some point before
-        cudaEvent_t         ready    = nullptr;  // recorded on the prefetch stream when the conversion is done
-        cudaEvent_t         done     = nullptr;  // recorded on the compute stream when the GEMM is done
+        void *              ptr          = nullptr;  // F16 staging buffer, pool memory
+        size_t              bytes        = 0;        // size of the pool allocation
+        const ggml_tensor * src0         = nullptr;  // weight staged in the buffer, null when the buffer is free
+        bool                in_use       = false;    // the GEMM reading the buffer was submitted
+        cudaEvent_t         ready        = nullptr;  // set by consume(): conversion-done event of the staged candidate
+        cudaEvent_t         pending_done = nullptr;  // recorded by release(), waited once when the slot is reused
     };
 
     struct candidate {
@@ -1474,17 +1473,31 @@ struct ggml_cuda_dequant_pipeline {
         const ggml_tensor * src0     = nullptr;
         size_t              bytes    = 0;
         int                 slot     = -1;  // assigned when the conversion is issued
+        cudaEvent_t         ready    = nullptr;  // recorded on the prefetch stream when the conversion is issued
     };
 
     // stream 0 is the compute stream, the concurrent graph regions use 1..n
     static constexpr int prefetch_stream_no = GGML_CUDA_MAX_STREAMS - 1;
 
+    // The conversion-done and GEMM-done events rotate through fixed pools instead of being owned
+    // by the slots. An event that is re-recorded while a wait for it is still in flight makes the
+    // wait observe the newer record (measured on V100 / CUDA 12.8, graphs on and off alike): with
+    // one event per slot each wait ended up gated on the GEMM recorded one generation later than
+    // intended, chaining dequant(k+1) behind GEMM(k) and removing all overlap. With the rotation
+    // an event is re-recorded only event_pool_size generations later, when every wait for its
+    // previous record has long fired, so each wait sees its own record under any binding semantics.
+    static constexpr size_t event_pool_size = 16;
+
     cudaStream_t prefetch_stream = nullptr;
     cudaEvent_t  fork_event      = nullptr;
     cudaEvent_t  join_event      = nullptr;
 
-    std::vector<slot>      slots;
-    std::vector<candidate> candidates;
+    std::vector<slot>        slots;
+    std::vector<candidate>   candidates;
+    std::vector<cudaEvent_t> ready_events;  // rotating pool, event_pool_size entries
+    std::vector<cudaEvent_t> done_events;   // rotating pool, event_pool_size entries
+    size_t                   next_ready_event = 0;
+    size_t                   next_done_event  = 0;
 
     size_t next_issue   = 0;
     size_t next_consume = 0;
@@ -1492,12 +1505,14 @@ struct ggml_cuda_dequant_pipeline {
     bool   active       = false;
 
     ~ggml_cuda_dequant_pipeline() {
-        for (slot & s : slots) {
-            if (s.ready != nullptr) {
-                CUDA_CHECK(cudaEventDestroy(s.ready));
+        for (cudaEvent_t e : ready_events) {
+            if (e != nullptr) {
+                CUDA_CHECK(cudaEventDestroy(e));
             }
-            if (s.done != nullptr) {
-                CUDA_CHECK(cudaEventDestroy(s.done));
+        }
+        for (cudaEvent_t e : done_events) {
+            if (e != nullptr) {
+                CUDA_CHECK(cudaEventDestroy(e));
             }
         }
         if (fork_event != nullptr) {

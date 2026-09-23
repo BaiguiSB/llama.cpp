@@ -4376,30 +4376,34 @@ void ggml_cuda_dequant_pipeline::begin(ggml_backend_cuda_context & ctx, std::vec
         CUDA_CHECK(cudaEventCreateWithFlags(&join_event, cudaEventDisableTiming));
     }
 
-    // The slots and their events persist across graph computes: recreating the events every begin()
-    // would leak the old ones, and an older cudaGraphExec_t may still reference them. Only the pool
-    // memory is reallocated (LIFO: allocated first, freed last in end()). The slot count is fixed by
-    // the environment, so the events are created exactly once.
+    // The slots, the event pools and the fork/join events persist across graph computes: recreating
+    // them every begin() would leak the old ones, and an older cudaGraphExec_t may still reference
+    // them. Only the pool memory is reallocated (LIFO: allocated first, freed last in end()).
     slots.resize(ggml_cuda_dequant_pipeline_n_slots());
+    if (ready_events.empty()) {
+        ready_events.resize(event_pool_size);
+        done_events.resize(event_pool_size);
+        for (size_t i = 0; i < event_pool_size; ++i) {
+            CUDA_CHECK(cudaEventCreateWithFlags(&ready_events[i], cudaEventDisableTiming));
+            CUDA_CHECK(cudaEventCreateWithFlags(&done_events[i],  cudaEventDisableTiming));
+        }
+    }
     for (slot & s : slots) {
-        if (s.ready == nullptr) {
-            CUDA_CHECK(cudaEventCreateWithFlags(&s.ready, cudaEventDisableTiming));
-        }
-        if (s.done == nullptr) {
-            CUDA_CHECK(cudaEventCreateWithFlags(&s.done, cudaEventDisableTiming));
-        }
         GGML_ASSERT(s.ptr == nullptr);
-        s.ptr      = ctx.pool().alloc(slot_bytes, &s.bytes);
-        s.src0     = nullptr;
-        s.in_use   = false;
-        s.consumed = false;
+        s.ptr          = ctx.pool().alloc(slot_bytes, &s.bytes);
+        s.src0         = nullptr;
+        s.in_use       = false;
+        s.ready        = nullptr;
+        s.pending_done = nullptr;
     }
 
     // Seed the events on the compute stream: while capturing, a wait on an event without a record inside
     // the capture region is an error, and this also makes the fork of the prefetch stream explicit.
-    for (slot & s : slots) {
-        CUDA_CHECK(cudaEventRecord(s.ready, ctx.stream()));
-        CUDA_CHECK(cudaEventRecord(s.done,  ctx.stream()));
+    for (const cudaEvent_t e : ready_events) {
+        CUDA_CHECK(cudaEventRecord(e, ctx.stream()));
+    }
+    for (const cudaEvent_t e : done_events) {
+        CUDA_CHECK(cudaEventRecord(e, ctx.stream()));
     }
     CUDA_CHECK(cudaEventRecord(fork_event, ctx.stream()));
     CUDA_CHECK(cudaStreamWaitEvent(prefetch_stream, fork_event));
@@ -4444,19 +4448,22 @@ void ggml_cuda_dequant_pipeline::on_node(int node_idx) {
         }
 
         slot & s = slots[free_slot];
-        if (s.consumed) {
+        if (s.pending_done != nullptr) {
             // wait for the GEMM that read this buffer, it may still be running
-            CUDA_CHECK(cudaStreamWaitEvent(prefetch_stream, s.done));
-            s.consumed = false;
+            CUDA_CHECK(cudaStreamWaitEvent(prefetch_stream, s.pending_done));
+            s.pending_done = nullptr;
         }
 
         if (!ggml_cuda_dequant_pipeline_skip()) {
             ggml_cuda_dequant_pipeline_convert(c.src0, s.ptr, prefetch_stream);
         }
-        CUDA_CHECK(cudaEventRecord(s.ready, prefetch_stream));
+        cudaEvent_t ready = ready_events[next_ready_event];
+        next_ready_event = (next_ready_event + 1) % ready_events.size();
+        CUDA_CHECK(cudaEventRecord(ready, prefetch_stream));
 
-        s.src0 = c.src0;
-        c.slot = free_slot;
+        c.ready = ready;
+        s.src0  = c.src0;
+        c.slot  = free_slot;
     }
 }
 
@@ -4465,7 +4472,8 @@ ggml_cuda_dequant_pipeline::slot * ggml_cuda_dequant_pipeline::consume(const ggm
         return nullptr;
     }
 
-    const int slot_idx = candidates[next_consume].slot;
+    candidate & c = candidates[next_consume];
+    const int slot_idx = c.slot;
     next_consume++;
 
     if (slot_idx < 0) {
@@ -4475,17 +4483,20 @@ ggml_cuda_dequant_pipeline::slot * ggml_cuda_dequant_pipeline::consume(const ggm
     slot & s = slots[slot_idx];
     GGML_ASSERT(s.src0 == src0 && !s.in_use);
     s.in_use = true;
+    s.ready  = c.ready;
 
     return &s;
 }
 
 void ggml_cuda_dequant_pipeline::release(ggml_backend_cuda_context & ctx, slot * s) {
     // the GEMM was submitted, the staging buffer can be reused once it completed
-    CUDA_CHECK(cudaEventRecord(s->done, ctx.stream()));
+    cudaEvent_t done = done_events[next_done_event];
+    next_done_event = (next_done_event + 1) % done_events.size();
+    CUDA_CHECK(cudaEventRecord(done, ctx.stream()));
 
-    s->consumed = true;
-    s->in_use   = false;
-    s->src0     = nullptr;
+    s->pending_done = done;
+    s->in_use       = false;
+    s->src0         = nullptr;
 }
 
 void ggml_cuda_dequant_pipeline::end(ggml_backend_cuda_context & ctx) {
@@ -4504,10 +4515,11 @@ void ggml_cuda_dequant_pipeline::end(ggml_backend_cuda_context & ctx) {
             ctx.pool().free(s.ptr, s.bytes);
             s.ptr = nullptr;
         }
-        s.bytes    = 0;
-        s.src0     = nullptr;
-        s.in_use   = false;
-        s.consumed = false;
+        s.bytes        = 0;
+        s.src0         = nullptr;
+        s.in_use       = false;
+        s.ready        = nullptr;
+        s.pending_done = nullptr;
     }
 
     active = false;
