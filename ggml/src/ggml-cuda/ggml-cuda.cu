@@ -4331,6 +4331,7 @@ void ggml_cuda_dequant_pipeline::begin(ggml_backend_cuda_context & ctx, std::vec
     candidates.clear();
     next_issue   = 0;
     next_consume = 0;
+    next_slot    = 0;
     slot_bytes   = 0;
 
     if (!ggml_cuda_dequant_pipeline_enabled() || cand.empty()) {
@@ -4439,21 +4440,38 @@ void ggml_cuda_dequant_pipeline::on_node(int node_idx) {
     // GPU). With this ordering the GEMM's blocks are resident first and the dequant fills the slots
     // the GEMM leaves free.
     while (next_issue < candidates.size() && candidates[next_issue].node_idx <= node_idx) {
-        int free_slot = -1;
-        for (int i = 0; i < (int) slots.size(); ++i) {
-            if (slots[i].src0 == nullptr) {
-                free_slot = i;
-                break;
+        candidate & c = candidates[next_issue];
+        if (c.bytes > slot_bytes) {
+            next_issue++;
+            continue;  // not staged, consume() falls back to converting inside the node
+        }
+
+        // Rotate through the slots instead of picking the first free one. With the node_idx bound
+        // above, every slot is host-side free at issue time (a candidate is consumed and released
+        // within its own node iteration), so first-free would always hand out the slot released by
+        // the immediately preceding GEMM, whose pending_done is that GEMM's completion: dequant(j)
+        // ends up gated on GEMM(j-1) while GEMM(j) is gated on dequant(j), a distance-1 chain that
+        // serializes the two streams by construction (nsys of 39b19d6f8: every prefetch-stream wait
+        // bound to the done record placed right after the previous GEMM launch, 1.1% overlap).
+        // Rotating keeps the reuse distance at slots.size(): dequant(j) only waits for the GEMM
+        // n_slots candidates back, so it is eligible to run while GEMM(j-1) executes, and it is
+        // still enqueued after the launch of GEMM(j-1), preserving the dispatch order above.
+        int free_slot = next_slot;
+        if (slots[free_slot].src0 != nullptr) {
+            free_slot = -1;  // unexpected (the rotation distance equals the slot count), fall back
+            for (int i = 0; i < (int) slots.size(); ++i) {
+                if (slots[i].src0 == nullptr) {
+                    free_slot = i;
+                    break;
+                }
             }
         }
         if (free_slot < 0) {
-            break;
+            next_issue++;
+            continue;  // no slot available, consume() falls back to converting inside the node
         }
-
-        candidate & c = candidates[next_issue++];
-        if (c.bytes > slot_bytes) {
-            continue;  // not staged, consume() falls back to converting inside the node
-        }
+        next_issue++;
+        next_slot = (free_slot + 1) % (int) slots.size();
 
         slot & s = slots[free_slot];
         if (s.pending_done != nullptr) {

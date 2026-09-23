@@ -1501,6 +1501,7 @@ struct ggml_cuda_dequant_pipeline {
 
     size_t next_issue   = 0;
     size_t next_consume = 0;
+    int    next_slot    = 0;  // rotating slot assignment, keeps the reuse distance at slots.size()
     size_t slot_bytes   = 0;  // size of the staging buffers
     bool   active       = false;
 
