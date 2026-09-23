@@ -1452,6 +1452,71 @@ struct ggml_cuda_stream_context {
     }
 };
 
+struct ggml_backend_cuda_context;
+
+// Overlaps the F16 conversion of quantized weights with the cuBLAS GEMMs that consume them.
+// The conversion of the weights still needed later runs on a second stream into a small ring of staging
+// buffers, so that the GEMM has to wait for a weight that was converted while the previous one was multiplied.
+// Only weights that are not written by the graph being computed can be converted early.
+struct ggml_cuda_dequant_pipeline {
+    struct slot {
+        void *              ptr      = nullptr;  // F16 staging buffer, pool memory
+        size_t              bytes    = 0;        // size of the pool allocation
+        const ggml_tensor * src0     = nullptr;  // weight staged in the buffer, null when the buffer is free
+        bool                in_use   = false;    // the GEMM reading the buffer was submitted
+        bool                consumed = false;    // the GEMM reading the buffer was submitted at some point before
+        cudaEvent_t         ready    = nullptr;  // recorded on the prefetch stream when the conversion is done
+        cudaEvent_t         done     = nullptr;  // recorded on the compute stream when the GEMM is done
+    };
+
+    struct candidate {
+        int                 node_idx = -1;
+        const ggml_tensor * src0     = nullptr;
+        size_t              bytes    = 0;
+        int                 slot     = -1;  // assigned when the conversion is issued
+    };
+
+    // stream 0 is the compute stream, the concurrent graph regions use 1..n
+    static constexpr int prefetch_stream_no = GGML_CUDA_MAX_STREAMS - 1;
+
+    cudaStream_t prefetch_stream = nullptr;
+    cudaEvent_t  fork_event      = nullptr;
+    cudaEvent_t  join_event      = nullptr;
+
+    std::vector<slot>      slots;
+    std::vector<candidate> candidates;
+
+    size_t next_issue   = 0;
+    size_t next_consume = 0;
+    size_t slot_bytes   = 0;  // size of the staging buffers
+    int    n_pending    = 0;  // conversions issued but not consumed yet
+    bool   active       = false;
+    bool   skip         = false;  // debug: leave the staging buffer stale, so that a wrong result proves the path is used
+
+    ~ggml_cuda_dequant_pipeline() {
+        for (slot & s : slots) {
+            if (s.ready != nullptr) {
+                CUDA_CHECK(cudaEventDestroy(s.ready));
+            }
+            if (s.done != nullptr) {
+                CUDA_CHECK(cudaEventDestroy(s.done));
+            }
+        }
+        if (fork_event != nullptr) {
+            CUDA_CHECK(cudaEventDestroy(fork_event));
+        }
+        if (join_event != nullptr) {
+            CUDA_CHECK(cudaEventDestroy(join_event));
+        }
+    }
+
+    void begin(ggml_backend_cuda_context & ctx, std::vector<candidate> && cand);
+    void on_node(int node_idx);
+    slot * consume(const ggml_tensor * src0);
+    void release(ggml_backend_cuda_context & ctx, slot * s);
+    void end(ggml_backend_cuda_context & ctx);
+};
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1522,6 +1587,7 @@ struct ggml_backend_cuda_context {
     }
 
     ggml_cuda_stream_context concurrent_stream_context;
+    ggml_cuda_dequant_pipeline dequant_pipeline;
 
     ~ggml_backend_cuda_context();
 

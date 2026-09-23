@@ -89,6 +89,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
@@ -1441,15 +1442,28 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     ggml_cuda_pool_alloc<cuda_t> src0_alloc(ctx.pool());
     ggml_cuda_pool_alloc<cuda_t> src1_alloc(ctx.pool());
 
+    ggml_cuda_dequant_pipeline::slot * pipe_slot = nullptr;
+
     bool is_src0_cont_2 = ggml_is_contiguous_2(src0);
     bool is_src1_cont_2 = ggml_is_contiguous_2(src1);
 
     if (src0->type == compute_type) {
         src0_ptr = (const cuda_t *) src0->data;
     } else {
-        src0_alloc.alloc(ggml_nelements(src0));
+        if constexpr (compute_type == GGML_TYPE_F16) {
+            pipe_slot = ctx.dequant_pipeline.consume(src0);
+        }
 
-        if (ggml_is_contiguously_allocated(src0)) {
+        if (pipe_slot != nullptr) {
+            CUDA_CHECK(cudaStreamWaitEvent(main_stream, pipe_slot->ready));
+            src0_ptr = (const cuda_t *) pipe_slot->ptr;
+            const size_t src0_bs = ggml_blck_size(src0->type);
+            s01 *= src0_bs;
+            s02 *= src0_bs;
+            s03 *= src0_bs;
+        } else if (ggml_is_contiguously_allocated(src0)) {
+            src0_alloc.alloc(ggml_nelements(src0));
+
             const auto convert_func = traits::convert(src0->type);
             GGML_ASSERT(convert_func != nullptr);
             convert_func(src0->data, src0_alloc.get(), ggml_nelements(src0), main_stream);
@@ -1458,6 +1472,8 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
             s02 *= src0_bs;
             s03 *= src0_bs;
         } else {
+            src0_alloc.alloc(ggml_nelements(src0));
+
             const auto convert_func = traits::convert_nc(src0->type);
             GGML_ASSERT(convert_func != nullptr);
             convert_func(src0->data, src0_alloc.get(), ne00, ne01, ne02, ne03, s01, s02, s03, main_stream);
@@ -1466,7 +1482,7 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
             s03 = ne02*s02;
             is_src0_cont_2 = true;
         }
-        src0_ptr = src0_alloc.get();
+        src0_ptr = pipe_slot != nullptr ? (const cuda_t *) pipe_slot->ptr : src0_alloc.get();
     }
 
     if (src1->type == compute_type) {
@@ -1610,6 +1626,10 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
                 ne23,
                 cu_compute_type,
                 CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    }
+
+    if (pipe_slot != nullptr) {
+        ctx.dequant_pipeline.release(ctx, pipe_slot);
     }
 
     // Convert output back to F32 if needed
@@ -4182,6 +4202,283 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     return 0;
 }
 
+static bool ggml_cuda_dequant_pipeline_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_DEQUANT_PIPELINE");
+        return env != nullptr && atoi(env) == 1;
+    }();
+    return enabled;
+}
+
+static int ggml_cuda_dequant_pipeline_n_slots() {
+    static const int n_slots = [] {
+        const char * env = getenv("GGML_CUDA_DEQUANT_PIPELINE_SLOTS");
+        return std::max(1, std::min(4, env != nullptr ? atoi(env) : 2));
+    }();
+    return n_slots;
+}
+
+static size_t ggml_cuda_dequant_pipeline_max_bytes() {
+    static const size_t max_bytes = [] {
+        const char * env = getenv("GGML_CUDA_DEQUANT_PIPELINE_MAX_MB");
+        return (size_t) std::max(1, env != nullptr ? atoi(env) : 512) * 1024 * 1024;
+    }();
+    return max_bytes;
+}
+
+// Would ggml_cuda_mul_mat() take the cuBLAS branch for this node? A false positive only wastes one
+// conversion into a staging buffer, so the predicates used by the dispatcher are enough.
+static bool ggml_cuda_mul_mat_uses_cublas(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst, int cc, int warp_size) {
+    if (!ggml_is_quantized(src0->type) || !ggml_is_contiguously_allocated(src0)) {
+        return false;
+    }
+    if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    const int64_t ne11 = src1->ne[1];
+    if (ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11)) {
+        return false;
+    }
+    if (ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false)) {
+        return false;
+    }
+    if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
+        return false;
+    }
+    if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
+        return false;
+    }
+    return true;
+}
+
+// Collect the weights of this graph that the pipeline may convert ahead of time, in node order.
+static void ggml_cuda_dequant_pipeline_scan(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, std::vector<ggml_cuda_dequant_pipeline::candidate> & out) {
+    const ggml_cuda_device_info & info = ggml_cuda_info();
+    const int cc        = info.devices[ctx.device].cc;
+    const int warp_size = info.devices[ctx.device].warp_size;
+
+    // only tensors that are not written by this graph can be read ahead of their node
+    std::unordered_set<const ggml_tensor *> written;
+    written.reserve(2 * cgraph->n_nodes);
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        written.insert(node);
+        // a graph node writing through a view writes the viewed tensor
+        if (node->view_src != nullptr) {
+            written.insert(node->view_src);
+        }
+    }
+
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (node->op != GGML_OP_MUL_MAT) {
+            continue;
+        }
+
+        const ggml_tensor * src0 = node->src[0];
+        const ggml_tensor * src1 = node->src[1];
+        if (src0 == nullptr || src1 == nullptr) {
+            continue;
+        }
+        // ggml keeps view_src pointing at the base tensor, so one level is enough
+        if (written.count(src0) != 0 || (src0->view_src != nullptr && written.count(src0->view_src) != 0)) {
+            continue;
+        }
+        if (!ggml_cuda_mul_mat_uses_cublas(src0, src1, node, cc, warp_size)) {
+            continue;
+        }
+
+        out.push_back({ i, src0, (size_t) ggml_nelements(src0) * sizeof(half), -1 });
+    }
+}
+
+static void ggml_cuda_dequant_pipeline_convert(const ggml_tensor * src0, void * dst, cudaStream_t stream) {
+    const auto convert_func = batched_mul_mat_traits<GGML_TYPE_F16>::convert(src0->type);
+    GGML_ASSERT(convert_func != nullptr);
+    convert_func(src0->data, (half *) dst, ggml_nelements(src0), stream);
+}
+
+void ggml_cuda_dequant_pipeline::begin(ggml_backend_cuda_context & ctx, std::vector<candidate> && cand) {
+    active = false;
+    candidates.clear();
+    slots.clear();
+    next_issue   = 0;
+    next_consume = 0;
+    slot_bytes   = 0;
+
+    if (!ggml_cuda_dequant_pipeline_enabled() || cand.empty()) {
+        return;
+    }
+    if (ctx.curr_stream_no != 0) {
+        GGML_LOG_DEBUG("%s: disabled, the graph is not computed on the compute stream\n", __func__);
+        return;
+    }
+    if (!ctx.stream_context().concurrent_events.empty()) {
+        GGML_LOG_DEBUG("%s: disabled, concurrent graph regions are in use\n", __func__);
+        return;
+    }
+    {
+        // the pipeline stages F16 data, a different compute type would need a different staging buffer
+        const char * env = getenv("GGML_CUDA_CUBLAS_COMPUTE_TYPE");
+        const std::string compute_type = env != nullptr ? env : "auto";
+        if (compute_type != "auto" && compute_type != "f16" && compute_type != "fp16") {
+            GGML_LOG_DEBUG("%s: disabled, GGML_CUDA_CUBLAS_COMPUTE_TYPE is %s\n", __func__, env);
+            return;
+        }
+    }
+
+    const size_t max_bytes = ggml_cuda_dequant_pipeline_max_bytes();
+    for (const candidate & c : cand) {
+        if (c.bytes <= max_bytes) {
+            slot_bytes = std::max(slot_bytes, c.bytes);
+        }
+    }
+    if (slot_bytes == 0) {
+        return;
+    }
+
+    candidates = std::move(cand);
+    skip = getenv("GGML_CUDA_DEQUANT_PIPELINE_SKIP") != nullptr;
+
+    prefetch_stream = ctx.stream(ctx.device, prefetch_stream_no);
+    if (fork_event == nullptr) {
+        CUDA_CHECK(cudaEventCreateWithFlags(&fork_event, cudaEventDisableTiming));
+    }
+    if (join_event == nullptr) {
+        CUDA_CHECK(cudaEventCreateWithFlags(&join_event, cudaEventDisableTiming));
+    }
+
+    slots.resize(ggml_cuda_dequant_pipeline_n_slots());
+    for (slot & s : slots) {
+        if (s.ready == nullptr) {
+            CUDA_CHECK(cudaEventCreateWithFlags(&s.ready, cudaEventDisableTiming));
+        }
+        if (s.done == nullptr) {
+            CUDA_CHECK(cudaEventCreateWithFlags(&s.done, cudaEventDisableTiming));
+        }
+        if (s.ptr == nullptr) {
+            s.ptr = ctx.pool().alloc(slot_bytes, &s.bytes);
+        }
+    }
+
+    // Seed the events on the compute stream: while capturing, a wait on an event without a record inside
+    // the capture region is an error, and this also makes the fork of the prefetch stream explicit.
+    for (slot & s : slots) {
+        CUDA_CHECK(cudaEventRecord(s.ready, ctx.stream()));
+        CUDA_CHECK(cudaEventRecord(s.done,  ctx.stream()));
+    }
+    CUDA_CHECK(cudaEventRecord(fork_event, ctx.stream()));
+    CUDA_CHECK(cudaStreamWaitEvent(prefetch_stream, fork_event));
+
+    active = true;
+
+    GGML_LOG_DEBUG("%s: %zu candidates, %zu slots of %zu bytes\n", __func__, candidates.size(), slots.size(), slot_bytes);
+}
+
+void ggml_cuda_dequant_pipeline::on_node(int node_idx) {
+    if (!active) {
+        return;
+    }
+
+    // Candidates that the node loop moved past without consuming them (fused node, node that did not take
+    // the cuBLAS branch) can not be consumed anymore.
+    while (next_consume < candidates.size() && candidates[next_consume].node_idx < node_idx) {
+        candidate & c = candidates[next_consume];
+        if (c.slot >= 0) {
+            slot & s = slots[c.slot];
+            GGML_ASSERT(s.src0 == c.src0 && !s.in_use);
+            s.src0 = nullptr;  // the conversion is ordered on the prefetch stream itself, no wait needed
+        }
+        next_consume++;
+    }
+
+    while (next_issue < candidates.size()) {
+        int free_slot = -1;
+        for (int i = 0; i < (int) slots.size(); ++i) {
+            if (slots[i].src0 == nullptr) {
+                free_slot = i;
+                break;
+            }
+        }
+        if (free_slot < 0) {
+            break;
+        }
+
+        candidate & c = candidates[next_issue++];
+        if (c.bytes > slot_bytes) {
+            continue;  // not staged, consume() falls back to converting inside the node
+        }
+
+        slot & s = slots[free_slot];
+        if (s.consumed) {
+            // wait for the GEMM that read this buffer, it may still be running
+            CUDA_CHECK(cudaStreamWaitEvent(prefetch_stream, s.done));
+            s.consumed = false;
+        }
+
+        if (!skip) {
+            ggml_cuda_dequant_pipeline_convert(c.src0, s.ptr, prefetch_stream);
+        }
+        CUDA_CHECK(cudaEventRecord(s.ready, prefetch_stream));
+
+        s.src0 = c.src0;
+        c.slot = free_slot;
+    }
+}
+
+ggml_cuda_dequant_pipeline::slot * ggml_cuda_dequant_pipeline::consume(const ggml_tensor * src0) {
+    if (!active || next_consume >= candidates.size() || candidates[next_consume].src0 != src0) {
+        return nullptr;
+    }
+
+    const int slot_idx = candidates[next_consume].slot;
+    next_consume++;
+
+    if (slot_idx < 0) {
+        return nullptr;
+    }
+
+    slot & s = slots[slot_idx];
+    GGML_ASSERT(s.src0 == src0 && !s.in_use);
+    s.in_use = true;
+
+    return &s;
+}
+
+void ggml_cuda_dequant_pipeline::release(ggml_backend_cuda_context & ctx, slot * s) {
+    // the GEMM was submitted, the staging buffer can be reused once it completed
+    CUDA_CHECK(cudaEventRecord(s->done, ctx.stream()));
+
+    s->consumed = true;
+    s->in_use   = false;
+    s->src0     = nullptr;
+}
+
+void ggml_cuda_dequant_pipeline::end(ggml_backend_cuda_context & ctx) {
+    if (!active) {
+        return;
+    }
+
+    // Join the prefetch stream into the compute stream: the captured graph needs it, and it also orders
+    // conversions that were issued but never consumed against any later use of the staging buffers.
+    CUDA_CHECK(cudaEventRecord(join_event, prefetch_stream));
+    CUDA_CHECK(cudaStreamWaitEvent(ctx.stream(), join_event));
+
+    for (int i = (int) slots.size() - 1; i >= 0; --i) {
+        slot & s = slots[i];
+        if (s.ptr != nullptr) {
+            ctx.pool().free(s.ptr, s.bytes);
+            s.ptr = nullptr;
+        }
+        s.bytes  = 0;
+        s.src0   = nullptr;
+        s.in_use = false;
+    }
+
+    active = false;
+}
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
 
@@ -4280,6 +4577,14 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 stream_ctx.concurrent_events.clear();
             }
 
+            {
+                std::vector<ggml_cuda_dequant_pipeline::candidate> candidates;
+                if (ggml_cuda_dequant_pipeline_enabled()) {
+                    ggml_cuda_dequant_pipeline_scan(*cuda_ctx, cgraph, candidates);
+                }
+                cuda_ctx->dequant_pipeline.begin(*cuda_ctx, std::move(candidates));
+            }
+
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 if (is_concurrent_event_active) {
@@ -4313,6 +4618,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
 
                 prev_i = i;
+
+                cuda_ctx->dequant_pipeline.on_node(i);
 
                 if (ggml_cuda_is_view_or_noop(node)) {
                     continue;
@@ -4361,6 +4668,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     try_launch_concurrent_event(node);
                }
             }
+
+            cuda_ctx->dequant_pipeline.end(*cuda_ctx);
         }
 
 #ifdef USE_CUDA_GRAPH
