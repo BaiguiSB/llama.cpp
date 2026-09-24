@@ -93,7 +93,16 @@ static __global__ void flash_attn_ext_xqa(
 
     using namespace nvcuda::wmma;
 
-    for (int k0 = split*TILE; k0 < n_kv; k0 += gridDim.y*TILE) {
+    // Balanced token ranges: split s owns [lo, hi). The ranges differ by at most
+    // one token, so every split runs the same number of tile iterations (the last
+    // one truncated to tv valid tokens). The old tile-strided loop gave the low
+    // splits one extra full tile whenever ntiles % gridDim.y != 0 (e.g. 42 tiles
+    // on 40 splits), doubling the critical path of the blocks that got them.
+    const int lo = (int) (((int64_t) split*n_kv) / gridDim.y);
+    const int hi = (int) (((int64_t) (split + 1)*n_kv) / gridDim.y);
+
+    for (int k0 = lo; k0 < hi; k0 += TILE) {
+        const int tv = min(TILE, hi - k0); // valid tokens in this tile
         // QK over dim panels, sKV holds one panel of K at a time, the
         // accumulator fragments live across the panels.
         fragment<accumulator, 8, 32, 16, float> c[NT];
@@ -105,15 +114,17 @@ static __global__ void flash_attn_ext_xqa(
 #pragma unroll
         for (int p = 0; p < D/PANEL; ++p) {
             // Load the K panel, dequantized to f16 in registers. 8 threads per token, one 16-dim slice each.
-            for (int i = tid; i < TILE*(PANEL/16); i += fattn_xqa_nthreads) {
+            for (int i = tid; i < tv*(PANEL/16); i += fattn_xqa_nthreads) {
                 const int t  = i / (PANEL/16);
                 const int sl = i - t*(PANEL/16);
                 dequantize_V_q8_0<half, 16>(K_head + (int64_t) (k0 + t)*nb11, &sKV[t][sl*16], p*PANEL + sl*16);
             }
             __syncthreads();
 
-            // Tensor cores, one warp per 32-token slice.
-            if (warp < TILE/32) {
+            // Tensor cores, one warp per 32-token slice. Slices entirely beyond
+            // a truncated tail are skipped; their stale sS columns are masked in
+            // the softmax below.
+            if (warp*WARP_SIZE < tv) {
                 const int slice = warp*32;
                 fragment<matrix_b, 8, 32, 16, half, col_major> b;
 #pragma unroll
@@ -130,7 +141,7 @@ static __global__ void flash_attn_ext_xqa(
             __syncthreads();
         }
 
-        if (warp < TILE/32) {
+        if (warp*WARP_SIZE < tv) {
             const int slice = warp*32;
 #pragma unroll
             for (int mt = 0; mt < NT; ++mt) {
@@ -141,7 +152,7 @@ static __global__ void flash_attn_ext_xqa(
 
         // Load the first V panel, then softmax and PV. The second panel reuses
         // the buffer, P stays in sS.
-        for (int i = tid; i < TILE*(PANEL/16); i += fattn_xqa_nthreads) {
+        for (int i = tid; i < tv*(PANEL/16); i += fattn_xqa_nthreads) {
             const int t  = i / (PANEL/16);
             const int sl = i - t*(PANEL/16);
             dequantize_V_q8_0<half, 16>(V_head + (int64_t) (k0 + t)*nb21, &sKV[t][sl*16], sl*16);
@@ -164,7 +175,10 @@ static __global__ void flash_attn_ext_xqa(
 #pragma unroll
             for (int i = 0; i < TILE/WARP_SIZE; ++i) {
                 const int t = lane + i*WARP_SIZE;
-                const float v = mrow ? sS[r][t] + __half2float(mrow[t]) : sS[r][t];
+                // Tail columns (t >= tv) hold stale/garbage scores from skipped
+                // MMA slices. Overwrite with -inf (not add, so no NaN can leak
+                // into mx); expf(-inf - mx) == 0 then zeroes their probability.
+                const float v = (t >= tv) ? -INFINITY : (mrow ? sS[r][t] + __half2float(mrow[t]) : sS[r][t]);
                 vals[i] = v;
                 mx = fmaxf(mx, v + FATTN_KQ_MAX_OFFSET);
             }
@@ -191,7 +205,7 @@ static __global__ void flash_attn_ext_xqa(
                 acc[j][i] *= m_scale;
             }
 
-            for (int t = 0; t < TILE; ++t) {
+            for (int t = 0; t < tv; ++t) {
                 const float prob = sS[r][t];
 #pragma unroll
                 for (int i = 0; i < PANEL/WARP_SIZE; ++i) {
@@ -202,7 +216,7 @@ static __global__ void flash_attn_ext_xqa(
         __syncthreads();
 
         // Second V panel, PV only. P and the rescaled accumulators are in place.
-        for (int i = tid; i < TILE*(PANEL/16); i += fattn_xqa_nthreads) {
+        for (int i = tid; i < tv*(PANEL/16); i += fattn_xqa_nthreads) {
             const int t  = i / (PANEL/16);
             const int sl = i - t*(PANEL/16);
             dequantize_V_q8_0<half, 16>(V_head + (int64_t) (k0 + t)*nb21, &sKV[t][sl*16], PANEL + sl*16);
@@ -215,7 +229,7 @@ static __global__ void flash_attn_ext_xqa(
             if (r >= rows) {
                 continue;
             }
-            for (int t = 0; t < TILE; ++t) {
+            for (int t = 0; t < tv; ++t) {
                 const float prob = sS[r][t];
 #pragma unroll
                 for (int i = 0; i < PANEL/WARP_SIZE; ++i) {
