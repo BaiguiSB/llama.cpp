@@ -152,7 +152,7 @@ static __global__ void flash_attn_ext_xqa(
         // P is written in place over S.
 #pragma unroll
         for (int j = 0; j < NT; ++j) {
-            const int r = warp + j*WARP_SIZE;
+            const int r = warp + j*8; // 8 rows per M tile, one warp per row
             if (r >= rows) {
                 continue;
             }
@@ -211,7 +211,7 @@ static __global__ void flash_attn_ext_xqa(
 
 #pragma unroll
         for (int j = 0; j < NT; ++j) {
-            const int r = warp + j*WARP_SIZE;
+            const int r = warp + j*8; // 8 rows per M tile, one warp per row
             if (r >= rows) {
                 continue;
             }
@@ -229,7 +229,7 @@ static __global__ void flash_attn_ext_xqa(
     // Epilogue, the writeout mirrors flash_attn_ext_vec.
 #pragma unroll
     for (int j = 0; j < NT; ++j) {
-        const int r = warp + j*WARP_SIZE;
+        const int r = warp + j*8; // 8 rows per M tile, one warp per row
         if (r >= rows) {
             continue;
         }
