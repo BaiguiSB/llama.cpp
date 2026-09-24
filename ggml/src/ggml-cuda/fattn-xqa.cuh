@@ -21,6 +21,13 @@
 
 constexpr int fattn_xqa_nthreads = 256;
 
+// Slices of the next tile's first K panel that each thread prefetches into
+// registers during softmax+PV. 2 slices = 18 registers, keeping NT=1 at ~109
+// of the 128 registers available under 2 blocks/SM so nothing spills to local
+// memory (4 slices pinned the allocation at 128 and spilled 10 u16 through a
+// local-memory round trip).
+constexpr int fattn_xqa_pf_slices = 2;
+
 // Register variant of dequantize_V_q8_0<half, 16>, bitwise identical: pf[0..7]
 // hold the raw u16 of one 16-quant slice (little-endian int8 pairs, the same
 // bytes ggml_cuda_memcpy_1<16, 2> loads), pf[8] the block scale as u16.
@@ -33,7 +40,11 @@ static __device__ __forceinline__ void dequantize_V_q8_0_regs(const unsigned sho
 }
 
 template<int NT> // NT == ceil(6*n_tokens/8), number of M = 8 Q tiles
-__launch_bounds__(fattn_xqa_nthreads, 2)
+// NT=1 fits 2 blocks/SM (2*45.3 KB smem <= 96 KB), NT>=2 needs 53.8/62.2 KB
+// and is smem-limited to 1 block/SM anyway. Promising 2 blocks there only
+// capped ptxas at 128 registers without any occupancy gain, which spilled
+// registers once the NT>=2 row loops actually executed.
+__launch_bounds__(fattn_xqa_nthreads, NT >= 2 ? 1 : 2)
 static __global__ void flash_attn_ext_xqa(
         const float * __restrict__ Q_ptr,   // f32 [head_dim, n_tokens, n_head]
         const void  * __restrict__ K_ptr,   // q8_0 [head_dim, n_kv, n_head_kv]
@@ -105,11 +116,11 @@ static __global__ void flash_attn_ext_xqa(
     using namespace nvcuda::wmma;
 
     // Register prefetch storage for the next tile's first K panel (used with
-    // NT == 1 only; its 36 registers keep NT=1 within the 128-register budget
-    // of 2 blocks/SM, NT >= 2 would spill). pf is left uninitialized on
-    // purpose: reads are guarded by pf_valid, which stays false for NT >= 2,
-    // so both are dead there and get eliminated.
-    unsigned short pf[4][9];
+    // NT == 1 only, covering the first 64 tokens of the tile; the remaining
+    // slices take the global path). pf is left uninitialized on purpose:
+    // reads are guarded by pf_valid, which stays false for NT >= 2, so both
+    // are dead there and get eliminated.
+    unsigned short pf[fattn_xqa_pf_slices][9];
     bool pf_valid = false;
 
     // Balanced token ranges: split s owns [lo, hi). The ranges differ by at most
@@ -122,6 +133,7 @@ static __global__ void flash_attn_ext_xqa(
 
     for (int k0 = lo; k0 < hi; k0 += TILE) {
         const int tv = min(TILE, hi - k0); // valid tokens in this tile
+        const int ngrp = (tv + WARP_SIZE - 1) / WARP_SIZE; // 32-column softmax groups with any valid column
         // QK over dim panels, sKV holds one panel of K at a time, the
         // accumulator fragments live across the panels.
         fragment<accumulator, 8, 32, 16, float> c[NT];
@@ -134,8 +146,10 @@ static __global__ void flash_attn_ext_xqa(
         for (int p = 0; p < D/PANEL; ++p) {
             // Load the K panel, dequantized to f16 in registers. 8 threads per token, one 16-dim slice each.
             // Panel 0 of every tile after the range's first one comes from the
-            // register prefetch (use_pf); the j-loop form keeps pf[j] indexed by
-            // an unrolled constant so the array stays in registers.
+            // register prefetch (use_pf, only the first fattn_xqa_pf_slices j
+            // slots hold data, the rest take the global path); the j-loop form
+            // keeps pf[j] indexed by an unrolled constant so the array stays
+            // in registers.
             const int nslices = tv*(PANEL/16);
             const bool use_pf = (p == 0) && pf_valid;
 #pragma unroll
@@ -144,7 +158,7 @@ static __global__ void flash_attn_ext_xqa(
                 if (i < nslices) {
                     const int t  = i / (PANEL/16);
                     const int sl = i - t*(PANEL/16);
-                    if (use_pf) {
+                    if (use_pf && j < fattn_xqa_pf_slices) {
                         dequantize_V_q8_0_regs(pf[j], &sKV[t][sl*16]);
                     } else {
                         dequantize_V_q8_0<half, 16>(K_head + (int64_t) (k0 + t)*nb11, &sKV[t][sl*16], p*PANEL + sl*16);
@@ -195,14 +209,15 @@ static __global__ void flash_attn_ext_xqa(
         // they overlap with softmax + PV (the longest compute window). The
         // dequantize at the top of the next iteration then reads registers
         // instead of stalling on global latency (long_sb/lg_throttle were
-        // ~30% of stall cycles). Same (t, sl) slice mapping as the load loop.
+        // ~30% of stall cycles). Same (t, sl) slice mapping as the load loop;
+        // fattn_xqa_pf_slices slices per thread cover the first 64 tokens.
         if constexpr (NT == 1) {
             pf_valid = false;
             const int nk0 = k0 + TILE;
             if (nk0 < hi) {
                 const int nslices = min(TILE, hi - nk0)*(PANEL/16);
 #pragma unroll
-                for (int j = 0; j < TILE*(PANEL/16)/fattn_xqa_nthreads; ++j) {
+                for (int j = 0; j < fattn_xqa_pf_slices; ++j) {
                     const int i = tid + j*fattn_xqa_nthreads;
                     if (i < nslices) {
                         const int t  = i / (PANEL/16);
@@ -235,13 +250,29 @@ static __global__ void flash_attn_ext_xqa(
 
             float mx = row_max[j];
             float vals[TILE/WARP_SIZE];
+            // tv is warp-uniform, so every i iteration covers one contiguous
+            // 32-column group: fully valid groups need no tail predicate (the
+            // common full-tile path is predicate-free again), fully invalid
+            // groups contribute nothing and are skipped, only the boundary
+            // group keeps the per-column tail handling.
 #pragma unroll
             for (int i = 0; i < TILE/WARP_SIZE; ++i) {
+                if (i >= ngrp) {
+                    vals[i] = -INFINITY; // never read: the exp loop guards the same way
+                    continue;
+                }
                 const int t = lane + i*WARP_SIZE;
-                // Tail columns (t >= tv) hold stale/garbage scores from skipped
-                // MMA slices. Overwrite with -inf (not add, so no NaN can leak
+                // Boundary group only: tail columns (t >= tv) hold stale/garbage
+                // scores from skipped MMA slices and the mask column can be out
+                // of range. Overwrite with -inf (not add, so no NaN can leak
                 // into mx); expf(-inf - mx) == 0 then zeroes their probability.
-                const float v = (t >= tv) ? -INFINITY : (mrow ? sS[r][t] + __half2float(mrow[t]) : sS[r][t]);
+                float v;
+                if ((i + 1)*WARP_SIZE <= tv) {
+                    // Fully valid group.
+                    v = (mrow ? sS[r][t] + __half2float(mrow[t]) : sS[r][t]);
+                } else {
+                    v = (t >= tv) ? -INFINITY : (mrow ? sS[r][t] + __half2float(mrow[t]) : sS[r][t]);
+                }
                 vals[i] = v;
                 mx = fmaxf(mx, v + FATTN_KQ_MAX_OFFSET);
             }
@@ -254,10 +285,19 @@ static __global__ void flash_attn_ext_xqa(
             float msum = 0.0f;
 #pragma unroll
             for (int i = 0; i < TILE/WARP_SIZE; ++i) {
+                if (i >= ngrp) {
+                    continue;
+                }
                 const int t = lane + i*WARP_SIZE;
                 const float prob = expf(vals[i] - mx);
-                sS[r][t] = prob;
-                msum += prob;
+                // Columns t >= tv have no readers (PV is bounded by tv, the
+                // next tile's store_matrix_sync only covers valid slices and
+                // the epilogue reads acc/row_sum), so the former zeroing
+                // store of P there was dead and is skipped.
+                if (t < tv) {
+                    sS[r][t] = prob;
+                    msum += prob;
+                }
             }
             msum = warp_reduce_sum(msum);
 
