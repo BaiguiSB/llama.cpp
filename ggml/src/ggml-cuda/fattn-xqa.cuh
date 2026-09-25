@@ -11,8 +11,13 @@
 // One block serves one (KV head, KV split) and computes all 6*n_tokens Q rows
 // on its split, so the KV of the split is read exactly once. This removes the
 // 6:1 GQA read redundancy of the vector kernel and the 3:1 of the tile kernel.
-// QK uses wmma 8x32x16 (f16 inputs, f32 accumulator), 4 consumer warps each
-// covering a 32-token slice. Softmax and PV are scalar, one warp per Q row.
+// QK and P*V both run on wmma 8x32x16 (f16 inputs, f32 accumulator). QK uses
+// 4 consumer warps, each covering a 32-token slice. Softmax runs scalar, one
+// warp per Q row, and writes P as f16 over the scores in a wmma A layout; the
+// PV fragments start from zero every tile, land in shared memory as f32 and
+// are folded into the row warps' scalar running output there, so the online
+// softmax rescale stays on the scalars and no fragment-to-lane layout of the
+// accumulator is ever assumed.
 // The M = 8 wmma tile holds the 6*n_tokens Q rows, tail rows zero-padded.
 // The KV smem buffer holds one 128-dim panel of the 128-token tile at a time,
 // QK accumulates over the panels and PV visits one V panel per pass.
@@ -68,6 +73,7 @@ static __global__ void flash_attn_ext_xqa(
     constexpr int PANEL    = 128; // K/V head dims held in smem per pass
     constexpr int QSTRIDE  = 272; // head_dim + 16, keeps every row start 32 B aligned for the wmma loads
     constexpr int KVSTRIDE = 144; // PANEL + 16, same alignment guarantee
+    constexpr int SPSTRIDE = 144; // TILE + 16, same guarantee for the score/P fragments
 
     const int tid  = threadIdx.x;
     const int warp = tid / WARP_SIZE;
@@ -80,9 +86,14 @@ static __global__ void flash_attn_ext_xqa(
     const char * V_head = (const char *) V_ptr + (int64_t) kv_head*nb22;
 
     extern __shared__ char smem[];
-    float (* sS )[TILE]     = (float (*)[TILE])     smem; // scores, P written in place
-    half  (* sQ )[QSTRIDE]  = (half  (*)[QSTRIDE])  (smem + sizeof(*sS)*8*NT);
-    half  (* sKV)[KVSTRIDE] = (half  (*)[KVSTRIDE]) (smem + sizeof(*sS)*8*NT + sizeof(*sQ)*8*NT);
+    // sP holds the QK scores, then the softmax probabilities in their place, as
+    // f16 in the row-major layout the PV wmma loads as its A operand. sO receives
+    // the per-tile P*V chunks as f32 for the row warps; the scores buffer cannot
+    // be reused for that because PV still reads P when it runs.
+    half  (* sP )[SPSTRIDE] = (half  (*)[SPSTRIDE]) smem;
+    float (* sO )[TILE]     = (float (*)[TILE])     (smem + sizeof(*sP)*8*NT);
+    half  (* sQ )[QSTRIDE]  = (half  (*)[QSTRIDE])  (smem + sizeof(*sP)*8*NT + sizeof(*sO)*8*NT);
+    half  (* sKV)[KVSTRIDE] = (half  (*)[KVSTRIDE]) (smem + sizeof(*sP)*8*NT + sizeof(*sO)*8*NT + sizeof(*sQ)*8*NT);
 
     // Q rows are head-major, r = qh*n_tokens + tok, so the zero-padded rows are
     // the tail of the last M tile.
@@ -168,7 +179,7 @@ static __global__ void flash_attn_ext_xqa(
             __syncthreads();
 
             // Tensor cores, one warp per 32-token slice. Slices entirely beyond
-            // a truncated tail are skipped; their stale sS columns are masked in
+            // a truncated tail are skipped; their stale sP columns are masked in
             // the softmax below.
             if (warp*WARP_SIZE < tv) {
                 const int slice = warp*32;
@@ -191,13 +202,13 @@ static __global__ void flash_attn_ext_xqa(
             const int slice = warp*32;
 #pragma unroll
             for (int mt = 0; mt < NT; ++mt) {
-                store_matrix_sync(&sS[mt*8][slice], c[mt], TILE, mem_row_major);
+                store_matrix_sync(&sP[mt*8][slice], c[mt], SPSTRIDE, mem_row_major);
             }
         }
         __syncthreads();
 
-        // Load the first V panel, then softmax and PV. The second panel reuses
-        // the buffer, P stays in sS.
+        // Load the first V panel; softmax and the tensor-core PV follow. The
+        // second panel reuses the buffer, P stays in sP.
         for (int i = tid; i < tv*(PANEL/16); i += fattn_xqa_nthreads) {
             const int t  = i / (PANEL/16);
             const int sl = i - t*(PANEL/16);
@@ -237,8 +248,11 @@ static __global__ void flash_attn_ext_xqa(
             }
         }
 
-        // Online softmax and PV on the first V panel, one warp per Q row.
-        // P is written in place over S.
+        // Online softmax, one warp per Q row. P is written in place over S as
+        // f16 in the layout the PV wmma loads as its A operand. The rescale of
+        // the running output is deferred to the panel-0 accumulation below, so
+        // the wmma fragments never need a (layout-dependent) per-row rescale.
+        float ms_tile[NT];
 #pragma unroll
         for (int j = 0; j < NT; ++j) {
             const int r = warp + j*8; // 8 rows per M tile, one warp per row
@@ -269,9 +283,9 @@ static __global__ void flash_attn_ext_xqa(
                 float v;
                 if ((i + 1)*WARP_SIZE <= tv) {
                     // Fully valid group.
-                    v = (mrow ? sS[r][t] + __half2float(mrow[t]) : sS[r][t]);
+                    v = (mrow ? __half2float(sP[r][t]) + __half2float(mrow[t]) : __half2float(sP[r][t]));
                 } else {
-                    v = (t >= tv) ? -INFINITY : (mrow ? sS[r][t] + __half2float(mrow[t]) : sS[r][t]);
+                    v = (t >= tv) ? -INFINITY : (mrow ? __half2float(sP[r][t]) + __half2float(mrow[t]) : __half2float(sP[r][t]));
                 }
                 vals[i] = v;
                 mx = fmaxf(mx, v + FATTN_KQ_MAX_OFFSET);
@@ -290,43 +304,73 @@ static __global__ void flash_attn_ext_xqa(
                 }
                 const int t = lane + i*WARP_SIZE;
                 const float prob = expf(vals[i] - mx);
-                // Columns t >= tv have no readers (PV is bounded by tv, the
-                // next tile's store_matrix_sync only covers valid slices and
-                // the epilogue reads acc/row_sum), so the former zeroing
-                // store of P there was dead and is skipped.
-                if (t < tv) {
-                    sS[r][t] = prob;
-                    msum += prob;
+                // Every column of a group with at least one valid token gets a
+                // P entry: the boundary group's k chunks overlap the valid range
+                // in the PV wmma below, so its tail columns must hold exact
+                // zeros there (expf of the -INFINITY tails is 0.0f). Groups past
+                // ngrp are skipped here and their k chunks are skipped by the PV
+                // loop bound, so stale data never enters a product.
+                if ((i + 1)*WARP_SIZE <= tv || t < tv) {
+                    sP[r][t] = __float2half_rn(prob);
                 }
+                msum += prob;
             }
             msum = warp_reduce_sum(msum);
 
             row_sum[j] = row_sum[j]*m_scale + msum;
             row_max[j] = mx;
-#pragma unroll
-            for (int i = 0; i < D/WARP_SIZE; ++i) {
-                acc[j][i] *= m_scale;
-            }
+            ms_tile[j] = m_scale;
+        }
+        __syncthreads(); // P complete: the PV below reads the rows of all warps
 
-            // Partial unroll: the bound is runtime (tv) now, and keeping the
-            // body small also limits the i-cache footprint of this hot loop
-            // (no_instruction was ~9% of stall cycles with the full unroll).
-#pragma unroll 8
-            for (int t = 0; t < tv; ++t) {
-                const float prob = sS[r][t];
+        // P*V on tensor cores, warps 0-3 each own a 32-dim slice of the V panel
+        // (the same consumer warps that produced the scores). The f32 result
+        // goes through sO to the row warps; the fragment starts from zero every
+        // tile and is never rescaled, so its lane layout is never assumed.
+        auto pv_mma = [&]() {
 #pragma unroll
-                for (int i = 0; i < PANEL/WARP_SIZE; ++i) {
-                    acc[j][i] = fmaf(prob, __half2float(sKV[t][lane + i*WARP_SIZE]), acc[j][i]);
+            for (int mt = 0; mt < NT; ++mt) {
+                fragment<accumulator, 8, 32, 16, float> c;
+                fill_fragment(c, 0.0f);
+                for (int kc = 0; 16*kc < tv; ++kc) {
+                    fragment<matrix_a, 8, 32, 16, half, row_major> a;
+                    load_matrix_sync(a, &sP[mt*8][16*kc], SPSTRIDE);
+                    fragment<matrix_b, 8, 32, 16, half, row_major> b;
+                    load_matrix_sync(b, &sKV[16*kc][warp*32], KVSTRIDE);
+                    mma_sync(c, a, b, c);
                 }
+                store_matrix_sync(&sO[mt*8][warp*32], c, TILE, mem_row_major);
+            }
+        };
+        if (warp < 4) {
+            pv_mma();
+        }
+        __syncthreads(); // sO ready; sKV free for the second V panel
+
+        // Fold the panel chunk into the running output, one warp per Q row.
+        // Panel 0 applies the softmax rescale deferred from the softmax above.
+#pragma unroll
+        for (int j = 0; j < NT; ++j) {
+            const int r = warp + j*8; // 8 rows per M tile, one warp per row
+            if (r >= rows) {
+                continue;
+            }
+#pragma unroll
+            for (int i = 0; i < PANEL/WARP_SIZE; ++i) {
+                acc[j][i] = acc[j][i]*ms_tile[j] + sO[r][i*WARP_SIZE + lane];
             }
         }
-        __syncthreads();
 
-        // Second V panel, PV only. P and the rescaled accumulators are in place.
+        // Second V panel, PV only. P and the rescaled output are in place.
         for (int i = tid; i < tv*(PANEL/16); i += fattn_xqa_nthreads) {
             const int t  = i / (PANEL/16);
             const int sl = i - t*(PANEL/16);
             dequantize_V_q8_0<half, 16>(V_head + (int64_t) (k0 + t)*nb21, &sKV[t][sl*16], PANEL + sl*16);
+        }
+        __syncthreads();
+
+        if (warp < 4) {
+            pv_mma();
         }
         __syncthreads();
 
@@ -336,13 +380,9 @@ static __global__ void flash_attn_ext_xqa(
             if (r >= rows) {
                 continue;
             }
-#pragma unroll 8
-            for (int t = 0; t < tv; ++t) {
-                const float prob = sS[r][t];
 #pragma unroll
-                for (int i = 0; i < PANEL/WARP_SIZE; ++i) {
-                    acc[j][PANEL/WARP_SIZE + i] = fmaf(prob, __half2float(sKV[t][lane + i*WARP_SIZE]), acc[j][PANEL/WARP_SIZE + i]);
-                }
+            for (int i = 0; i < PANEL/WARP_SIZE; ++i) {
+                acc[j][PANEL/WARP_SIZE + i] += sO[r][i*WARP_SIZE + lane];
             }
         }
         __syncthreads();
@@ -388,6 +428,7 @@ static void fattn_xqa_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
     constexpr int TILE = 128;
     constexpr int QSTRIDE  = 272;
     constexpr int KVSTRIDE = 144;
+    constexpr int SPSTRIDE = 144;
 
     const ggml_tensor * Q    = dst->src[0];
     const ggml_tensor * K    = dst->src[1];
@@ -416,7 +457,8 @@ static void fattn_xqa_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
     float scale = 1.0f;
     memcpy(&scale, (const float *) KQV->op_params + 0, sizeof(float));
 
-    constexpr size_t nbytes_shared = sizeof(float)*8*NT*TILE + sizeof(half)*(8*NT*QSTRIDE + TILE*KVSTRIDE);
+    constexpr size_t nbytes_shared = sizeof(half)*8*NT*SPSTRIDE + sizeof(float)*8*NT*TILE
+                                   + sizeof(half)*(8*NT*QSTRIDE + TILE*KVSTRIDE);
 
     // Enough KV splits to fill the GPU, each split reads its tiles exactly once.
     // The kernel is memory bound, more splits than two waves only add combine work.
