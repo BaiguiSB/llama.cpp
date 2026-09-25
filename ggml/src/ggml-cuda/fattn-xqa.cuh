@@ -13,11 +13,11 @@
 // 6:1 GQA read redundancy of the vector kernel and the 3:1 of the tile kernel.
 // QK and P*V both run on wmma 8x32x16 (f16 inputs, f32 accumulator). QK uses
 // 4 consumer warps, each covering a 32-token slice. Softmax runs scalar, one
-// warp per Q row, and writes P as f16 over the scores in a wmma A layout; the
-// PV fragments start from zero every tile, land in shared memory as f32 and
-// are folded into the row warps' scalar running output there, so the online
-// softmax rescale stays on the scalars and no fragment-to-lane layout of the
-// accumulator is ever assumed.
+// warp per Q row, reading the f32 scores and writing P as f16 into a wmma A
+// layout buffer; the PV fragments start from zero every tile, land in shared
+// memory as f32 and are folded into the row warps' scalar running output
+// there, so the online softmax rescale stays on the scalars and no
+// fragment-to-lane layout of the accumulator is ever assumed.
 // The M = 8 wmma tile holds the 6*n_tokens Q rows, tail rows zero-padded.
 // The KV smem buffer holds one 128-dim panel of the 128-token tile at a time,
 // QK accumulates over the panels and PV visits one V panel per pass.
@@ -86,10 +86,11 @@ static __global__ void flash_attn_ext_xqa(
     const char * V_head = (const char *) V_ptr + (int64_t) kv_head*nb22;
 
     extern __shared__ char smem[];
-    // sP holds the QK scores, then the softmax probabilities in their place, as
-    // f16 in the row-major layout the PV wmma loads as its A operand. sO receives
-    // the per-tile P*V chunks as f32 for the row warps; the scores buffer cannot
-    // be reused for that because PV still reads P when it runs.
+    // sP holds the softmax probabilities as f16 in the row-major layout the PV
+    // wmma loads as its A operand. sO is double duty: the f32 QK scores land
+    // here first, and once the softmax has consumed them into registers and
+    // written P, each PV pass stores its f32 P*V chunk into the same buffer
+    // for the row warps to fold into the running output.
     half  (* sP )[SPSTRIDE] = (half  (*)[SPSTRIDE]) smem;
     float (* sO )[TILE]     = (float (*)[TILE])     (smem + sizeof(*sP)*8*NT);
     half  (* sQ )[QSTRIDE]  = (half  (*)[QSTRIDE])  (smem + sizeof(*sP)*8*NT + sizeof(*sO)*8*NT);
@@ -179,7 +180,7 @@ static __global__ void flash_attn_ext_xqa(
             __syncthreads();
 
             // Tensor cores, one warp per 32-token slice. Slices entirely beyond
-            // a truncated tail are skipped; their stale sP columns are masked in
+            // a truncated tail are skipped; their stale sO columns are masked in
             // the softmax below.
             if (warp*WARP_SIZE < tv) {
                 const int slice = warp*32;
@@ -202,7 +203,7 @@ static __global__ void flash_attn_ext_xqa(
             const int slice = warp*32;
 #pragma unroll
             for (int mt = 0; mt < NT; ++mt) {
-                store_matrix_sync(&sP[mt*8][slice], c[mt], SPSTRIDE, mem_row_major);
+                store_matrix_sync(&sO[mt*8][slice], c[mt], TILE, mem_row_major);
             }
         }
         __syncthreads();
@@ -248,10 +249,11 @@ static __global__ void flash_attn_ext_xqa(
             }
         }
 
-        // Online softmax, one warp per Q row. P is written in place over S as
-        // f16 in the layout the PV wmma loads as its A operand. The rescale of
-        // the running output is deferred to the panel-0 accumulation below, so
-        // the wmma fragments never need a (layout-dependent) per-row rescale.
+        // Online softmax, one warp per Q row. The f32 scores are read from sO
+        // and P is written as f16 into sP, in the layout the PV wmma loads as
+        // its A operand. The rescale of the running output is deferred to the
+        // panel-0 accumulation below, so the wmma fragments never need a
+        // (layout-dependent) per-row rescale.
         float ms_tile[NT];
 #pragma unroll
         for (int j = 0; j < NT; ++j) {
@@ -283,9 +285,9 @@ static __global__ void flash_attn_ext_xqa(
                 float v;
                 if ((i + 1)*WARP_SIZE <= tv) {
                     // Fully valid group.
-                    v = (mrow ? __half2float(sP[r][t]) + __half2float(mrow[t]) : __half2float(sP[r][t]));
+                    v = (mrow ? sO[r][t] + __half2float(mrow[t]) : sO[r][t]);
                 } else {
-                    v = (t >= tv) ? -INFINITY : (mrow ? __half2float(sP[r][t]) + __half2float(mrow[t]) : __half2float(sP[r][t]));
+                    v = (t >= tv) ? -INFINITY : (mrow ? sO[r][t] + __half2float(mrow[t]) : sO[r][t]);
                 }
                 vals[i] = v;
                 mx = fmaxf(mx, v + FATTN_KQ_MAX_OFFSET);
