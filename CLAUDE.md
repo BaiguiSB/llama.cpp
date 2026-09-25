@@ -486,6 +486,30 @@ f32 累加器只有 float* 重载而保持 f32 进 sO(softmax 消费后 sO 复�
    -> ~1.2, XU 26.8% 最忙计算管线) > combine 并行化 (5.57μs, 24 块 latency-bound) >
    bank conflict (4.53M, f16 P 的 STS.U16 2-way, 非首项)。FA 已降至 step 13.6%, 打磨到
    DRAM 下限 e2e 增量 v1 约 +4-7%, 与 lm_head (P0.5) 量级相当
+6. [已实施并证伪 2026-09-25, 已回退] QK 装载流水 (参考库 QK_SW_PIPELINE 结构): K 改 4x64 维
+   panel 双缓冲 (sKQ0/1 [128][72] 别名 V 的 [128][144]), warp 4-7 生产者装载 p+1 与 warp 0-3
+   消费 wmma 并行。寄存器两轮调通 (NT=1 第二轮 128/STACK 0, 靠 pf 打包 u16[9]x2 -> uint4+u16
+   18->10 reg + 生产者 unroll 4->2), 但 64K 三树 e2e 全跌: **27.63/46.16/71.57 vs v5 基线
+   28.48/48.05/73.23 = -3.0/-3.9/-2.3%**, 且 NT=2/3 在 REG 130/153 无 spill 下跌 ->
+   结构性负优化, 与寄存器无关 (寄存器一刀切政策同批被用户指出不当, NT=2/3 预算 255 应放开用)。
+   机理: 旧结构 8 warp 全员装载 (MLP 满) + pf 寄存器预取跨 tile 藏延迟已是好点; 流水线把装载
+   收缩到 4 warp, q8_0 反量化每 16 维 ~10 条指令使生产者成关键路径 (估算 X~1.5x(C/2) ->
+   QK 相 +7% -> e2e -2.8%, 与实测吻合)。参考库该路径默认启用的条件是 **fp16 KV**
+   (use 处 k_cache.scalar_type()==at::kHalf, flash_decode_paged.cu:5526): 其生产者是纯拷贝
+   (LDG.128+STS.128 零计算), 4 warp 够用 —— 与 q8_0 反量化生产者不可比。
+   裁决: 该路线对 "q8 直读 + 16 warp/SM 延时受限" 内核**证伪关闭**。回退保留: P 尾列修复
+   (t<ceil16(tv), 见下) / pf 打包 (18->10 reg, NT=1 拿回 ~8 reg 余量)。被否版本存档
+   /tmp/xqa_qk_pipeline_rejected.patch。教训: (a) 移植参考库设计前核对其 env 默认的
+   **使用点门控** (kHalf 条件藏在 5526 行, 不在 env 函数里); (b) 生产者带反量化的装载流水
+   只在装载 << 计算时成立, 否则单边瓶颈; (c) FA 剩余项重排: backlog #1 关闭, 下一个候选
+   = int8->f16 转换指令经济性 (XU 26.8%) 或 combine 并行化
+   同批附带一处正确性修复 (独立改动可单独对拍): softmax P 写入门控 t<tv -> t<ceil16(tv)。
+   e02e1ead9 的"死存储消去"按 t>=tv 删了边界组尾列的零存储, 但 PV 的 A 装载按 16 列整块读
+   (kc 上界 16*kc<tv), tv%16!=0 时最后 chunk 读到 [tv,ceil16(tv)) 的 stale P×stale V 列;
+   分片边界 floor(split*n_kv/40) 产生任意 tv, 每 split 尾 tile 必触发 (n_kv=64240 例: 尾
+   tile tv=70, chunk[64,80) 含 10 个 stale 列)。原注释明说尾列"must hold exact zeros"与代码
+   矛盾, 修复即恢复注释语义。PPL 判据: 修复前后应微小移动 (stale 实非零) 或不动 (若 stale
+   恒零则原代码无害, 修复成无操作), 二者皆可接受
 
 ### 未完成的验证
 
@@ -504,6 +528,9 @@ f32 累加器只有 float* 重载而保持 f32 进 sO(softmax 消费后 sO 复�
   输出 + 接受率塌方, 不可能到 0.8)。严格 logits 逐位对拍不再必要
 - 多深度 a/b 分离降级为可选 (64K e2e 已答斜率无倒退); 旧 report 作废,
   新基准 = ~/report/xqa_full_v4 (与 e2e 同深度 64000)
+- [进行中 2026-09-25] 回退后残留验证: 构建 -> cuobjdump (NT=1 应回到 ~128/STACK 0, pf 打包
+  后余量更足) -> 64K 三树 e2e 应回到 v5 基线 (28.48/48.05/73.23, 判定回退干净) -> PPL 对拍
+  (P 尾列修复的独立效应: 预期微小移动或不动, 二者皆可)
 ## 目标模型: Qwen3.8-27B (qwen35, 带视觉与 MTP)
 
 (HF config 的 model_type 即 "qwen3_5"/Qwen3_5ForConditionalGeneration; 本地权重为 Qwen3.8-27B 系,
