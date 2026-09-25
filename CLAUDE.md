@@ -23,10 +23,16 @@ cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=70
 # FA VEC 内核的量化组合, 默认已含 q4_0-q4_0;q8_0-q8_0;f16-f16;bf16-bf16 (ggml/CMakeLists.txt ~207)
 # 如需扩展: -DGGML_CUDA_FA_QUANTS="q8_0-q8_0;q4_0-q4_0;f16-f16;bf16-bf16"
 
-cmake --build build --target llama-bench llama-perplexity llama-cli -j
+cmake --build build --target llama-bench llama-batched-bench llama-perplexity llama-cli -j
 
 # decode 性能对比(fa 默认开; 对比 ctk/ctv f16 vs q8_0 vs q4_0)
 ./build/bin/llama-bench -m <model.gguf> -ngl 99 -p 512 -n 128 -fa 1 -ctk q8_0 -ctv q8_0
+
+# 单并发 verify 形状 A/B(本 fork 新增 -ntgs: 每步单序列连续 ntgs 个 token, logits 全 true,
+# 对齐 server MTP verify 的批次形状; 接受逗号列表如 -ntgs 1,2,3,4, 每 ntgs 值展开一行 tg 测试
+# (标签 tg128 @ v4); ntgs>=2 时 FA 走 TILE, ntgs=1 走 VEC 作对照;
+# 跨 ntgs 的 t/s 不可比——batch 化本身的收益会混入, 必须同 ntgs 对比两棵树)
+./build/bin/llama-bench -m <model.gguf> -ngl 99 -fa on -ctk q8_0 -ctv q8_0 -p 4096 -n 128 -ntgs 4 -r 3
 
 # 精度对拍(改造前后 perplexity 应逐位一致或极接近)
 ./build/bin/llama-perplexity -m <model.gguf> -ngl 99 -f <wiki.txt> -fa 1 -ctk q8_0 -ctv q8_0
@@ -321,7 +327,9 @@ prefill 期间 nvidia-smi 全程 99-100% util / ~240W → GPU 受限属实(nsys 
 打满带宽。**消除 staging 只省显存, 不省时间** —— 已由 P0 实测 -0.7% 证实。
 显存收益依然成立, 是这条结论目前唯一的价值。
 
-## 方案 B: TILE 内核直读量化 KV (未实施)
+## 方案 B: TILE 内核直读量化 KV (q8_0 已落地 2026-09-18, 本节保留原始设计)
+
+[q8_0 已落地 2026-09-18 于分支 v100/tile-q8-direct, 实施细节与验证状态见下方"针对性优化优先级"P1 条目; 本节保留原始设计。]
 
 核心思想: decode 是显存带宽瓶颈, 消灭 staging 往返, 让 TILE 在装载时反量化直接进 shared memory, 下游计算路径不动。
 **定位(2026-09-20 修正)**: 主要价值在**显存**(staging 预留消失), 而非速度;
@@ -348,7 +356,158 @@ prefill 期间 nvidia-smi 全程 99-100% util / ~240W → GPU 受限属实(nsys 
 - VEC 不动; K/V cache 是独立张量, K 与 V 的反量化路径都要实现
 - 已否决/搁置: 方案 A(放宽 VEC 路由给 GQA decode, 赌 L2 去重, 只作对照实验, 最坏比现状差 60%); fp8_e4m3 KV(ggml 无 F8 类型, 端到端新类型工程量是方案 B 的 2-4 倍, 只省 6% 显存; 若将来做, Hadamard rotation 需手动接线, fa-v100 的软件转换可抄)
 
+## XQA-TC 内核: GQA 6:1 去重的 decode 内核 (2026-09-24 落地)
+
+按 flash-attention-v100 xqa_tc 的设计实现(不移植代码, MMA 用标准 nvcuda::wmma):
+一个 block 负责一个 (KV 头, KV 分片), 6 个 Q 头 x n_tokens 打包成 ceil(6n/8) 个
+M=8 WMMA tile(尾部零填充), KV 只读一次。
+
+- 文件: `fattn-xqa.cuh`(内核+launcher)/ `fattn-xqa.cu`(gate+入口); fattn.cu 5 处接入
+  (enum 300, Volta 分支最前, alloc 不留 f16 staging, dispatch, include)
+- gate(`ggml_cuda_fattn_xqa_supported`): D=256 + q8_0-q8_0 + gqa_ratio==6 + n_tokens∈[1,4] +
+  Q/K/V ne[3]==1 + 无 ALiBi/softcap/sinks + mask F16 共享或 null + n_kv%128==0 + V 布局同 K;
+  env `GGML_CUDA_FA_XQA_FALLBACK=1` 强制回退(同二进制 A/B 正控制)
+- 结构: 256 线程; QK 与 PV 均走 wmma 8x32x16(A row_major ld=272 / B ld=144, 行首 32B 对齐)。
+  QK = 4 consumer warp 各 32-token 切片; softmax = 8 warp 行轮转(r = warp + j*8) 标量在线
+  max/sum, P 以 f16 写入 sP[8NT][144](wmma A 布局); PV(1a4252b9a 起) = warp 0-3 各认 V 面板
+  32 维切片, fragment 每 tile 从零累加, store_matrix_sync 落 sO f32 后由行 warp 标量折叠
+  (panel 0 顺带在线 rescale, 不依赖 fragment lane 映射); smem sP[8NT][144] half +
+  sO[8NT][128] f32(S 先落此处, softmax 消费后复用为 PV chunk) + sQ[8NT][272] half +
+  sKV[128][144] half (NT=1 共 47616B -> 2 block/SM; NT=2 58368B / NT=3 69120B -> 各 1 block/SM,
+  launch_bounds 按 NT 放宽 (256, NT>=2?1:2)); 数值: S 保持 f32, P 过一次 f16,
+  不再与 VEC 逐位一致 (PPL 极接近, 已验证)
+- **KV 按 128 维 panel 分批进 smem**: QK 累加器跨 2 个 panel 存活, V 两面板两趟 PV。
+  参考库的 136/144 步长是 panel(128 维)行步长而非整维行步长, 整块 256 维需 64KB+ 会爆 smem
+- 分片: pb = min(2*nsm/H_kv, ntiles) = 40(V100), grid (1,40,4)=160 block 恰 1 波;
+  pb>1 时走 `flash_attn_combine_results`(与 VEC/TILE 同一 dst_tmp/dst_meta ABI, 逐位镜像 VEC 写出公式)
+- 路由效果: n=1(普通 decode 与 MTP draft)原走 VEC、n=2..4(MTP verify)原走 TILE q8 直读,
+  现全部进 XQA; prefill(>4 token)仍 MMA_F16, 多序列/其他形状原路不动
+- one-shot 日志 "FA XQA tensor-core path taken" 打印的是首次 eligible 调用
+  (warmup 时 n_kv=256 -> pb=2); 稳态 n_kv>=5120 后 pb=40
+
+### 实测 (llama-bench -p 0 -n 128 -fa 1 -ctk/ctv q8_0, Uncensored-Q4_K_M 15.65GiB) (文件现位于 llama_models/Qwen3.8-27B-Uncensored-GGUF/)
+
+| 深度 | VEC(fallback) | XQA | 提升 |
+|---|---:|---:|---|
+| d10240 | 30.81 t/s (32.46 ms/step) | 31.53 (31.71) | +2.3% |
+| d64000 | 22.67 t/s (44.11 ms/step) | 27.52 (36.34) | **+21.4%** |
+
+64K 拆解: VEC FA = 15.65ms(6x 读 13.4GB) -> XQA FA 实测 7.9ms(1x 读 2.24GB,
+**有效带宽 ~284GB/s, 距 ~850 还有 ~3x**)。该差距随 n_kv 线性放大(吞吐型而非固定开销),
+d10240 的 +2.3% 偏小同因。P2 预估 +25% 已兑现大半, 剩余空间在下面。
+(上表为初版代码 2026-09-24 记录; e02e1ead9 后 2026-09-25 复测 22.64/27.26 = +20.4%,
+内核级 398.62μs/351GB/s, 见下方 v4 终审节; TC-PV 后同日 28.48 = +25.8%,
+301.41μs/464GB/s, 见 v5 终审节)
+
+### 三 commit 优化落地与裁决 (2026-09-24 晚, 详见 ~/report/xqa_v3_verdict.md)
+
+commit: add96b7ea(修 NT>=2 PV/epilogue 行映射, 正确性) aad960a2e(split 按 token 均分)
+d2e08e8ae(PV 期间寄存器预取下一 tile K p0 + PV unroll 8)。诊断基线 ~/report/xqa_analysis.md (v2)。
+
+实测裁决 (nsys in-flight, 注意 v3 capture 是 --n-depth 10240, 基线 5120, 不可绝对直比):
+- 主 launch (1,40,4): 91.23μs @n_kv 10496 vs 改前两点模型 (27.36μs+7.26ns/tok) 103.6μs
+  -> **净 −11.9% @10K** (敏感区间 −10.0..−13.7%); 5376 等效无法折算只能给界 54-60μs
+  (−9.5..−18.7%; --n-depth 工况 capture 内 n_kv 恒定, 一份 capture=直线单点, a/b 不可分);
+  预测 28-30μs 未达成 (最好极端 54μs, 差 ~1.8x)
+- 均衡目标完全兑现: SM active 55.6->97.7%, per-SM max/min 1.77x->±1.6%, lg_throttle 1.73->0.89
+- **预取触发红线**: REG 128 顶死, pf 36 reg 中 10 个 spill (LDL/STL 23K/12.8K warp-inst,
+  local L1 命中 0.02%, ~4.6MB DRAM 往返), long_sb 1.90->3.83/inst, 每 token DRAM 2.25->2.97KB,
+  L2 hit 36.3->21.3%; **斜率恶化风险**: 10K 单点的 −11.9% 与"截距大降+斜率变差"兼容,
+  64K 外推 −2.5%..+5% 含倒退; 分离 a/b 需同二进制 ≥2 深度 capture, 修 spill 前不跑 64K bench
+- 纯开销直接测量: warmup 对照 (1,2,4) 同形状 27.5->34.3μs (+25%) = 逐列 (t>=tv) 谓词 +
+  运行时边界 + 双路径 i-cache 的代价 (该形状下均衡/预取均不生效)
+- e2e (d10240, 3 次): XQA 31.45/56.48/82.56 vs TILE-q8 回退 30.71/56.77/83.19 vs vanilla
+  30.73/55.54/81.68 (v1/v2/v4); XQA/回退 = +2.41%/−0.51%/−0.76%。FA 族仅占 step 4.74%
+  (1.55ms/32.7ms), d10240 对 XQA vs TILE 无鉴别力, 胜负在 >=32K 深度
+- step 构成 (稳态 busy): mul_mat_vec_q (MoE+GEMV) 79.8%, FA 4.8%, rms 3.8%, GDN 全部 ~1%;
+  FA 打磨到 DRAM 下限在 10K 深度天花板 ~+3% -> lm_head (P0.5) 与 MoE 路径优先级上升
+- NT=1 PPL 已复验 (7937ffd2b); NT>=2 数值正确性仍欠 (server MTP 接受率或 logits 对比)
+
+### v4 终审: e02e1ead9 后 64K 全链路验证 (2026-09-25, 详见 ~/report/xqa_full_v4/v4_verdict.md)
+
+nsys+ncu 与三次 e2e bench 同深度 (64000) 同二进制同会话; 旧 report (5120/10240 深度) 作废。
+- 内核 in-flight: 主 launch (1,40,4) 中位 **398.62μs** (p10-p90 ±0.4%, n_kv=64256),
+  6.20ns/token, 有效带宽 **351GB/s** (峰值 39%), 距 DRAM 下限 ~160μs **2.5x**;
+  combine 5.70μs; FA/step 6.47ms = step 的 17.2%
+- ncu (锁频 1.23GHz): **LDL/STL 运行时全 0** (红线 cuobjdump 外第二确认), DRAM
+  2.71KB/token (读冗余 1.24x, KV 单读兑现), 停顿 barrier 2.24 > long_sb 1.88 > wait 1.36
+  (long_sb 从 spill 时代 3.83 回落), HMMA 2.4%, SM 均衡 ±1.8%, shared 冲突超额 wavefront
+  +17.4% (折算 ~3-5%, 维持不单独修)
+- e2e (d64000, -ntgs 1,2,4 三树): XQA 27.26/44.06/64.83, 回退 22.64(VEC)/43.07/64.81
+  (TILE-q8), vanilla 22.64/39.66/60.00 -> XQA/回退 **+20.4%/+2.3%/+0.0%**,
+  XQA/vanilla +20.4%/+11.1%/+8.1%; 会话内自洽链: XQA 内核比 VEC 快 2.2x @64K
+- 裁决: ①64K 无倒退 (对初版软参照 +21.4%->+20.4%, 跨会话噪声内), v3 时代斜率风险解除;
+  ②(1,2,4) 33.28μs 未回 27.5 = 小形状固定开销 (n_kv=256 每 split 恰 1 全满 tile, 截断
+  机制不生效; 残余=运行时边界+双路径形态), 64K 每 block 12.55 tile 摊薄无 e2e 影响, 关闭;
+  ③**v2/v4 对 TILE-q8 打平 -> TC-PV 立项**: 1x 读优势被 2.5x 于下限的实现吃掉
+  (TILE-q8 近峰值流式), 到下限则 v1 +12% t/s (36.68->32.8ms/step)、v2/v4 翻盘;
+  ④tile-q8 vs vanilla verify 收益随深度放大 (+8.6%/+8.0% @64K vs 17K 时 +1.3%/+2.4%) 兑现;
+  ⑤MTP 实跑首证 (llama-server --spec-draft-n-max 3): verify 批 1-4 token, NT=1/2/3 全走
+  XQA, 输出正常; JSON 56-61 t/s @ acceptance 0.798 / 自由文本 34-35 t/s @ 0.352
+  (tok/step 2.94 vs 1.52, step ~48-53/~43-45ms 含 batch4 verify + 3x draft + 采样开销,
+  与 bench 工况不同不可直比)
+
+### TC-PV 落地与 v5 终审 (2026-09-25, commit 1a4252b9a+899db4b1c, 详见 ~/report/xqa_full_v5/v5_verdict.md)
+
+PV 搬上 wmma: softmax 把 P 以 f16 写入 sP(wmma A 布局), V 面板直接作 B; PV fragment
+每 tile 从零累加, 经 store_matrix_sync 落 sO f32, 行 warp 标量折叠(panel 0 顺带在线
+rescale)——不依赖 fragment lane 映射, 累加保持 f32, epilogue/combine 未动。S 因 wmma
+f32 累加器只有 float* 重载而保持 f32 进 sO(softmax 消费后 sO 复用为 PV chunk 缓冲),
+数值差异仅 P 一次 f16 舍入; 边界组零填充成为 wmma 正确性必需(非死存储)。同工况与 v4
+严格可比(对照组漂移 ≤0.15%):
+- 内核: nsys 主 launch 398.62 -> **301.41μs (−24.4%)**, 4.69ns/token, 有效带宽 464GB/s
+  (52% 峰值), 距 DRAM 下限 1.88x; **warp-inst 71.58M -> 35.95M (−50%)**; HMMA 2.4->6.5%,
+  LSU 39.1->15.4%; 停顿谱换位为 long_sb 3.99 (28%) > barrier 2.70 > lg_throttle 2.00
+  (内存延迟 42% 成第一瓶颈); (1,2,4) 33.28->25.60μs; combine 5.57
+- e2e (d64000 三树): XQA **28.48/48.05/73.23** (v1/v2/v4), 较 TC-PV 前 +4.5/+9.1/+13.0%;
+  对回退 **+25.8/+11.5/+12.8%**, 对 vanilla +25.7/+21.0/+22.0% —— v2/v4 从 TILE 平替
+  翻成双位数领先; 涨幅随行数放大(标量 PV 代价 ∝ 行数, wmma 解耦)
+- 门槛: cuobjdump NT=1/2/3 = REG 128/143/168, STACK/LDL/STL 全 0 + ncu 运行时 local 全 0;
+  PPL 极接近 + server MTP 正常
+- 剩余 1.88x 归因: 装载延迟(long_sb+lg_throttle 42%, 16 warp/SM) > int8->f16 转换
+  (XU 26.8% 最忙计算管线) > bank conflict(4.53M, 非首项); FA 已降至 step 13.6%,
+  到下限的 e2e 增量 v1 约 +4-7% -> FA branch 最大单项已收割, lm_head (P0.5) 优先级升回
+
+### 后续优化点 (2026-09-25 修订, 旧版 bank-conflict 主线已证伪)
+
+1. [已落地并验证 e02e1ead9] 修 spill + 削截断开销: pf 缩 pf[2][9] (18 reg, 91+18=109
+   留 ptxas 余量) + softmax 按 32 列组截断 (整组有效走无谓词直路, 仅边界组保留逐列
+   -INFINITY 覆写) + t>=tv 死存储消去 (PV 上界 tv, 下 tile store_matrix 只写有效 slice)
+   -> 验证 2026-09-25: cuobjdump + ncu 运行时双确认 LDL/STL=0, 64K 无倒退 (v4 终审节);
+   (1,2,4) 小形状 33.3μs 未回 27.5 属固定开销 (该形状全满 tile 截断不生效), 已关闭
+2. [已落地 e02e1ead9] NT>=2 launch_bounds 放宽 (256,1): NT=2/3 smem 53.8/62.2KB 本来就
+   1 block/SM, 2-block 承诺的 128 reg 上限纯损失 (add96b7ea 后 NT=3 spill 5 reg 的根因)
+3. ~~STS bank conflict~~ 已证伪: ptxas 自动把 8xSTS.32 合并成 2xSTS.128, 残余冲突值 1-3%
+4. [已落地并验证 1a4252b9a+899db4b1c, 2026-09-25] TC-PV: PV wmma 化, warp-inst −50% 运行时
+   兑现, 内核 398.6->301.4μs, e2e v1/v2/v4 +4.5/+9.1/+13.0%, v2/v4 对 TILE 翻成双位数
+   领先 (见 v5 终审节)
+5. v5 后 FA 剩余项 (按 v5 停顿谱排序): PANEL=64 双缓冲/装载流水 (long_sb+lg_throttle 42%
+   成第一瓶颈, 16 warp/SM 藏不住装载延迟) > int8->f16 magic 转换 (PRMT+I2F 2.5 条/元素
+   -> ~1.2, XU 26.8% 最忙计算管线) > combine 并行化 (5.57μs, 24 块 latency-bound) >
+   bank conflict (4.53M, f16 P 的 STS.U16 2-way, 非首项)。FA 已降至 step 13.6%, 打磨到
+   DRAM 下限 e2e 增量 v1 约 +4-7%, 与 lm_head (P0.5) 量级相当
+
+### 未完成的验证
+
+- 稳态 pb=40 已确认 (nsys v3/v4: 主 grid (1,40,4), 5120 实例)
+- e02e1ead9 验证链 (全部闭环 2026-09-25): 构建✓ -> cuobjdump✓ (NT=1/2/3 = REG 128/144/163,
+  STACK/LDL/STL 全 0) -> nsys/ncu v4✓ (运行时 LDL/STL=0, long_sb 回落 1.88, 64K 内核
+  398.62μs) -> 64K e2e✓ (无倒退, +20.4% 保住) -> PPL 复验✓ (用户实测通过, NT=1 逐位
+  等价设计兑现)
+- TC-PV 验证链 (全部闭环 2026-09-25): cuobjdump NT=1/2/3 = REG 128/143/168, STACK/LDL/STL
+  全 0 + ncu 运行时 local 全 0 -> nsys/ncu v5✓ (主 launch 301.41μs, −24.4%) -> e2e 三树✓
+  (对照组 ±0.15% 不动) -> PPL 极接近✓ + server MTP 正常✓ (用户实测)。
+  **XQA 线数值与性能验证全部闭环, 剩余均为纯性能 backlog**
+- [已闭环 2026-09-25, 运行级] NT>=2 数值正确性: llama-server 实跑 MTP (--spec-draft-n-max 3,
+  verify 批 1-4 token -> NT=1/2/3 全走 XQA), 输出内容正常; JSON 56-61 t/s @ acceptance 0.798,
+  自由文本 34-35 t/s @ 0.352 —— 接受率呈"结构化>>自由文本"健康签名 (行映射若错会是垃圾
+  输出 + 接受率塌方, 不可能到 0.8)。严格 logits 逐位对拍不再必要
+- 多深度 a/b 分离降级为可选 (64K e2e 已答斜率无倒退); 旧 report 作废,
+  新基准 = ~/report/xqa_full_v4 (与 e2e 同深度 64000)
 ## 目标模型: Qwen3.8-27B (qwen35, 带视觉与 MTP)
+
+(HF config 的 model_type 即 "qwen3_5"/Qwen3_5ForConditionalGeneration; 本地权重为 Qwen3.8-27B 系,
+注意力画像与 Qwen3.5-27B 画像一致 —— 两线对同一架构的两种称呼, 2026-09-25 合并注)
 
 注意力画像(决定所有 FA 优化):
 - 64 层 = 48 层线性注意力(GDN, 无 KV cache) + 16 层 full attention(标准 KV cache + FA)
@@ -390,12 +549,29 @@ prefill 期间 nvidia-smi 全程 99-100% util / ~240W → GPU 受限属实(nsys 
 
 对照基线树: `/home/baigui/nvme/llama.cpp`(上游 vanilla, 供 A/B 对拍构建)。
 
+另一主模型目录(2026-09-25 合并注: XQA/decode 线 bench 所用):
+`/home/baigui/nvme/llama_models/Qwen3.8-27B-Uncensored-GGUF/`:
+
+| 文件 | 大小 | 用途 |
+|---|---:|---|
+| `Qwen3.8-27B-Uncensored-Q4_K_M.gguf` | 16 GiB | 主模型(XQA/llama-bench 测量所用) |
+| `mmproj-Qwen3.8-27B-Uncensored-f16.gguf` | 889 MiB | 视觉 |
+
+MTP draft 用 LynnStyle 目录下的 `mtp-Qwen3.8-27B-Q4_0.gguf`。
+(旧记录 `/home/baigui/nvme/models/Qwen3.8-27B/Qwen3.8-27B-UD-Q4_K_M.gguf` 已随目录迁移失效。)
+
 ### 该模型在 V100 上的 FA 路由(已由 nsys 实测确认)
+
+**(2026-09-24 起 n=1..4 的 decode/verify/draft 已被 XQA-TC 接管, 见上文专用节, 本节保留为历史画像)**
 
 - 单序列 decode: 有效 batch 1x2=2 -> **VEC**(grid `(1,13,24)`), 量化直读, 无 staging
   (通用警告"gqa%4 落 TILE"对 6:1 不适用)。但见上文 GQA 冗余, 长上下文下它是第二大开销
 - MTP verify(k>=2 个 draft)与多序列 decode: 有效 batch >=4 -> TILE -> staging 往返
-- prefill(ubatch 512): MMA_F16 -> staging, grid 192x1x1 / smem 67584B
+  (多序列仅限 -kvu unified KV; 默认 split KV n_stream=n_seq_max, split_equal 按序列拆
+  ubatch, 每个 FA 退化 1 行走 VEC, 2026-09-19 实测踩坑)
+- prefill(ubatch 512): MMA_F16 -> staging, grid 192x1x1 / smem 67584B; staging 往返二次方
+  增长, 64K 上下文时 staging 流量(~10.7GB/ubatch)与 tensor core 计算同级, full-attn prefill
+  被拖慢 1.7-2x
 
 ### 优化优先级 (2026-09-20 nsys 重排)
 
@@ -407,6 +583,14 @@ prefill 期间 nvidia-smi 全程 99-100% util / ~240W → GPU 受限属实(nsys 
 | P3 | 融合 433 次 `quantize_q8_1` + 305 次 `rms_norm`(grid 只有 1~48 block, 纯延迟) | decode +3~4% | 每内核 2.6-7.2 µs, 与 mmv 严格一对一 |
 | — | ~~P0.5 lm_head 量化~~ | **已失效** | 现模型 `output.weight` 已是 Q6_K, 每 token 1.16 ms(3.0%) |
 
+合并注记 (2026-09-25, 两线合流时更新):
+- 表 P2 (VEC 的 GQA 去重, 预测 decode 长上下文 +25%) -> **已由 XQA-TC 内核兑现** (2026-09-24/25
+  落地, d64000 对回退 +25.8%, 见 XQA-TC 专用节)
+- 表 P0 (dequantize_block_* 提速) -> `v100/perfill-pipeline` 线攻击中 (capped-grid 持久化
+  dequant 内核; CAP 扫描证伪重叠路线=寄存器堆互斥, WIP)
+- 表 P1 (FA prefill 占用率) / P3 (融合 quantize_q8_1 + rms_norm) -> 未动
+- FA 内部剩余 backlog 见 XQA-TC 节"后续优化点 (2026-09-25 修订)"
+
 已否决/已证伪:
 - **MMA_F16 量化直读(旧 P0, 2026-09-17 落地)**: 实测 -0.7% 负优化, 改动在分支 `v100/mma-q8-direct`。
   原因已由 nsys 查明:**FA 不吃带宽**(全程 ~14 GB/s), 瓶颈是占用率。消除 staging 只省显存。
@@ -415,6 +599,26 @@ prefill 期间 nvidia-smi 全程 99-100% util / ~240W → GPU 受限属实(nsys 
   - 本模型实际进入情况: prefill ubatch(512 行) -> (32,2) 实例命中; Q 行数 <=8 的尾巴 ubatch -> (8,2) 未实例化逐调用回退(supported() 与 alloc_size 互为镜像, 无显存错配)
   - 验证方法论(重要): q8_0 与 baseline 的 PPL 逐位一致是设计预期(load_tile 反量化链与 convert.cu dequantize_block_q8_0_f16 是同一条 __hmul2), 因此 PPL 对拍既不能证明路径进入也不能证伪; 正控制 = 同一二进制设/不设 GGML_CUDA_FA_MMA_QUANT_FALLBACK 对比 compute buffer 大小(应差一个 staging)与 eval 时间。2026-09-17 实测 PPL 均值方差与 baseline 完全一致, 正控制待跑
 
+### 针对性优化优先级 (FA 线记录, 2026-09-25 合并自 xqa 线)
+
+- P0.5: [已核查 2026-09-25, 杠杆已兑现, 关闭] lm_head 量化: 本模型 UD-Q4_K_M 的 output.weight
+  实为 **Q6_K 1.04GB** (llama-gguf 直读 tensor[0]; 早前按 F16 2.5GB 估的 ~2.8ms/step=14% step
+  不成立), 每 step 全读 ~1.2-1.5ms ≈ step 的 3.5-4% (nsys v5 佐证: mul_mat_vec_q<Q6_K> 长尾
+  1.2-1.5ms 恰 320 实例 = 1/step, 且全 capture 无任何 F16 GEMV 内核)。再往下只有 q6_K->q4_K
+  (~省 0.5ms/step, 输出层质量风险) 不值。decode 剩余大头 = mul_mat_vec_q 家族 ~72% busy
+  (量化权重流), 下一个可选审计 = ncu 该家族达成带宽 (433 次/step 小 launch 多为 latency-bound,
+  合并/加宽存在工程空间但回报递减)
+- P1: [已落地 2026-09-18, 分支 v100/tile-q8-direct] 方案 B(TILE 量化直读)定位调整: 服务 MTP verify 与多序列 decode, 普通 decode 用不上
+  - 改造点: fattn-tile.cuh `flash_attn_tile_load_tile` 加 type_KV/elem0(K 与 V 共用此函数), q8_0 分支复用 fattn-common.cuh `dequantize_V_q8_0<half,2*cpy_ne>` 寄存器反量化写 shared; iter_KQ/iter/kernel 透传 type_K/type_V, q8_0 时 stride 保持字节单位; q8_0 行(34B 块)无法 half2 指针前移定位切片, K 尾段由 elem0 定位(F16 走指针前移, 互斥不重复计账)
+  - 提交链: 4cddb5514(内核装载) 0d9531b73(分派/显存接入 + 实例文件)
+  - 实例与分派: (256,256) x ncols2∈{1,2} x ncols1∈{1,2,4,8,16} 共 9 组(ncols2=1 时 ncols1 恒 >=2), 实例文件 fattn-tile-instance-dkq256-dv256-q8_0.cu(CMake GLOB 自动收编, 新文件需重新 configure); ncols2=4/8(gqa%4 模型)与 ncols1=32 暂回退 staging, 扩容=加 DECL + 放宽 `ggml_cuda_fattn_tile_q8_supported` 里两处检查
+  - 与 mma 分支的关键差异: supported()(fattn-tile.cu)是分派与 get_alloc_size 共用的唯一判定源, staging 恰好在被使用时才预留, 结构性规避 supported/alloc 镜像失配 bug 类; GGML_CUDA_FA_TILE_QUANT_FALLBACK env 已移除(2026-09-19, A/B 改用 /home/baigui/nvme/llama.cpp vanilla 树构建做跨二进制约); 路径进入确认 = ggml_cuda_flash_attn_ext_tile_case_q8 每实例(每 (ncols1,ncols2) 组合)首次被调度时往 stderr 打一行 fprintf
+  - 验证状态: [运行级 A/B 已跑 2026-09-19] 载具 llama-batched-bench, 必须加 -kvu(默认 split KV 按序列拆 ubatch, FA 退化 1 行走 VEC, 踩坑实录)且 -fa 新版参数是 on/off/auto: `./build/bin/llama-batched-bench -m <模型> -ngl 99 -fa on -ctk q8_0 -ctv q8_0 -kvu -c 16896 -npp 4096 -ntg 128 -npl 1,2,4`, 对照 = vanilla 树(/home/baigui/nvme/llama.cpp)同参数, 各 3 次: pl=1(VEC 对照) 27.96 vs 27.97 t/s 持平; pl=2 TILE(2,2) 49.53 vs 48.90 (+1.3%); pl=4 TILE(4,2) 68.81 vs 67.21 (+2.4%); 版本内重复性 <0.15%, 信号 10-30 倍于组内极差, 判定真实收益而非噪声; PP 两版持平(本分支未动 MMA)✓; 机制核对: pl=4/n_kv~16.9K 时消除的 staging 流量理论 ~2.2GB/step(~2.5ms@880GB/s), 实测省 1.39ms/step(~56%), 缺口即内核窄加载+反量化指令开销(上次指令经济性分析的预测, 归 P2); 收益 ∝ n_kv, 长上下文应继续放大(32K 变体: -npp 16000 -npl 1,2 -c 32768); 逐 token 数值一致性与 staging 显存回落待 server MTP 路径最终确认; pl=8(8,2) 实例未测(-c 16896 放不下, 需 33792); 单并发 verify 工况(llama-bench -ntgs, 见 Build/Bench 节)工具已就绪, 数据待跑
+  (注: UD-Q4_K_M = 合并时的旧主模型记录, 现位于 llama_models/Qwen3.8-27B-Uncensored-GGUF/,
+  见"本地模型文件"节)
+- P2: 量化 decode 路由实验(VEC 只有 24 block, 占用率 30%; P1 后可试 TILE 分区+GQA 打包, 预期 3-5%)
+  —— 已被 XQA-TC 内核实质兑现(见上文专用节), 关闭
+
 ## flash-attention-v100/ 参考库(只读)
 
 来自 V100 优化版 vLLM 的 FA 库, 放在仓库根目录仅供查阅。torch/ATen 依赖, paged KV, 不参与构建, 不要链接或移植代码。
@@ -422,3 +626,8 @@ prefill 期间 nvidia-smi 全程 99-100% util / ~240W → GPU 受限属实(nsys 
 - 可借鉴设计: smem bank conflict padding 步长(264/136), QK panel 双缓冲, 按固定 GQA 比值定制 WMMA M=8 tile(**6 头+零填充 —— 与本模型 gqa_ratio=6 直接对口, 见 P2**), sawtooth 分区路由
 - 它高度特化(GROUP_SIZE=6/D=256/固定页数 784/1616/MTP5), 形状不匹配时 fallback 是无 GQA 打包的标量内核, 比 llama TILE 弱; 移植不划算
 - fp8 软件转换参考: `kernel/fp8_kv_utils.cuh`(位操作, e4m3/e5m2)
+
+## 编辑历史
+  **(2026-09-24 起 decode/verify/draft 已被 XQA-TC 接管, 见上文专用节, 本小节保留为历史画像)**
+  **(2026-09-25 分支重组: base 线[nsys 剖面/PP/TG 画像, server 分阶段基准, checkpoint 审计, 模型迁移记录]与
+  xqa 线[XQA-TC, tile q8, FA 线记录]在本文件合流; 优先级表交叉注记见"合并注记")**
