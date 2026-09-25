@@ -3,7 +3,6 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
 
-#include <cstdio>
 #include <mma.h>
 
 // Specialized FlashAttention decode kernel for Volta, Qwen3.8-27B only:
@@ -467,12 +466,6 @@ static void fattn_xqa_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
     const int ntiles = K->ne[1] / TILE;
     const int parallel_blocks = std::min(std::max(2*nsm / (int) K->ne[2], 1), ntiles);
 
-    static bool logged = false;
-    if (!logged) {
-        logged = true;
-        fprintf(stderr, "%s: FA XQA tensor-core path taken, NT = %d, rows = %d, n_tokens = %d, parallel_blocks = %d\n",
-                __func__, NT, rows, n_tokens, parallel_blocks);
-    }
 
     ggml_cuda_pool_alloc<float> dst_tmp(pool);
     ggml_cuda_pool_alloc<float2> dst_tmp_meta(pool);
