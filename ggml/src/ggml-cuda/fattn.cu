@@ -4,6 +4,7 @@
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn-xqa.cuh"
+#include "fattn-xqa8.cuh"
 #include "fattn.cuh"
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
@@ -496,6 +497,7 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_TILE    = 200,
     BEST_FATTN_KERNEL_VEC     = 100,
     BEST_FATTN_KERNEL_XQA     = 300,
+    BEST_FATTN_KERNEL_XQA8    = 301,
     BEST_FATTN_KERNEL_MMA_F16 = 400,
 };
 
@@ -647,6 +649,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         if (ggml_cuda_fattn_xqa_supported(device, dst)) {
             return BEST_FATTN_KERNEL_XQA;
         }
+        if (ggml_cuda_fattn_xqa8_supported(device, dst)) {
+            return BEST_FATTN_KERNEL_XQA8;
+        }
         if (can_use_vector_kernel && Q->ne[1] * gqa_ratio_eff <= 2) {
             return BEST_FATTN_KERNEL_VEC;
         }
@@ -719,6 +724,9 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
         case BEST_FATTN_KERNEL_XQA:
             // q8_0 direct loading needs no f16 staging, must stay in sync with ggml_cuda_fattn_xqa_supported
             break;
+        case BEST_FATTN_KERNEL_XQA8:
+            // q8_0 direct loading needs no f16 staging, must stay in sync with ggml_cuda_fattn_xqa8_supported
+            break;
         case BEST_FATTN_KERNEL_MMA_F16:
             need_f16_K = true;
             need_f16_V = true;
@@ -751,6 +759,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             break;
         case BEST_FATTN_KERNEL_XQA:
             ggml_cuda_flash_attn_ext_xqa(ctx, dst);
+            break;
+        case BEST_FATTN_KERNEL_XQA8:
+            ggml_cuda_flash_attn_ext_xqa8(ctx, dst);
             break;
         case BEST_FATTN_KERNEL_MMA_F16:
             ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);

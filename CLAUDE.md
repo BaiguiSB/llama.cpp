@@ -245,6 +245,30 @@ XU 压力; ② combine 并行化(5.57µs, 24 块 latency-bound, 参考库 split_
   P 尾列零填充 t<ceil16(tv) + pf 预取打包 18→10 reg(9f5b6e237; 该修复的 PPL 独立效应未跑,
   预期微小移动或不动, 皆可接受)
 
+### GQA=8 派生内核 fattn-xqa8 (2026-09-25 代码完成, 待编译 + GGUF 验证)
+
+目标模型 Qwen3.6-35B-A3B (qwen35moe, HF config 已逐项核对): head_dim 256, 16 Q 头/2 KV 头 = GQA 8,
+40 层 = 30 GDN + 10 full-attn (KV 仅 10.6 KiB/token), MTP 1 层, max_pos 262K; build_attn 调用形式
+(qwen35moe.cpp:342) 与 qwen35 逐字相同, gate 前提(无 ALiBi/softcap/sinks, F16 共享 mask)成立。
+
+零修改加法派生: `fattn-xqa8.{cuh,cu}` = 原文件包 `namespace fattn_xqa8` + 仅 5 处数值改动
+(q_head0/head 乘 8, rows=8n, gate ratio==8, nt=(8n+7)/8 == n_tokens) + case 4; fattn.cu 5 处 11 行
+纯插入(include/enum 301/路由/alloc/dispatch, 0 行删除)。fattn-xqa.{cuh,cu} 一字未动, GQA=6 路径按编译
+单元隔离逐位不变, 无需回归验证。两文件故意不重缩进保持可 diff 对拍: 今后 fattn-xqa 的任何修复
+必须机械同步到 fattn-xqa8 (双改契约)。唯一非数值差异: pf 分支的 `dequantize_V_q8_0_regs` 调用带
+`fattn_xqa8::` 限定 —— half* 实参的 ADL 会在 fattn.cu TU(含两头文件)把 fattn-xqa.cuh 的全局孪生
+拉成同签名二义(首建实踩), 同步修复时必须保留该限定; 其余重名符号均为函数指针取值/常量引用, 无 ADL。
+
+结构差异: NT == n_tokens 且 M=8 tile 恒满载(零填充循环成死代码, 保留)。NT=4 为新增实例
+(smem 79872B < 96K opt-in, 1 block/SM, launch_bounds 的 NT>=2 分支已覆盖; REG 预估 190-200,
+cuobjdump 无 spill 是硬门槛待实测)。gridDim.z=2 -> pb=min(80,ntiles): NT=1 时 (1,80,2)=160 block
+恰 1 波, NT>=2 为 2 波(与现模型同状况)。env 开关与 GQA=6 共用(GGML_CUDA_FA_XQA_FALLBACK, 两 gate
+按 ratio 互斥); 回退路径不同于 GQA=6: gqa_ratio_eff=8 > 2 -> 不走 VEC, n<=2 落 TILE staging,
+n>=3 落 MMA_F16 ((256,256) q8 tile 无 ncols2=8 实例), XQA8 的对照优势包含整个 staging 往返。
+
+待办(用户侧): 编译(CMake GLOB 需重新 configure); cuobjdump 查 NT=1..4 REG/STACK/LDL/STL;
+GGUF 到手后 fallback A/B + PPL 对拍 + MTP acceptance 签名闭环(口径同 v5 验证链)。
+
 ## TILE q8_0 直读 (P1, 2026-09-18 落地, 分支 v100/tile-q8-direct)
 
 定位: 曾服务 MTP verify 与多序列 decode; XQA 落地后主要作回退路径与对照基线。
